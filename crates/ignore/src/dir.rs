@@ -469,6 +469,14 @@ impl Ignore {
                         .map(IgnoreMatch::gitignore);
             }
             saw_git = saw_git || ig.0.has_git;
+            if !m_custom_ignore.is_none()
+                && !m_ignore.is_none()
+                && (!any_git
+                    || saw_git
+                    || (!m_gi.is_none() && !m_gi_exclude.is_none()))
+            {
+                break;
+            }
         }
         if self.0.opts.parents {
             if let Some(abs_parent_path) = self.absolute_base() {
@@ -529,6 +537,14 @@ impl Ignore {
                                 .map(IgnoreMatch::gitignore);
                     }
                     saw_git = saw_git || ig.0.has_git;
+                    if !m_custom_ignore.is_none()
+                        && !m_ignore.is_none()
+                        && (!any_git
+                            || saw_git
+                            || (!m_gi.is_none() && !m_gi_exclude.is_none()))
+                    {
+                        break;
+                    }
                 }
             }
         }

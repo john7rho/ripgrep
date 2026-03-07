@@ -40,6 +40,12 @@ pub(crate) struct Core<'s, M: 's, S> {
     /// Cached flag: true when any context (before or after) is configured.
     /// Avoids recomputing `max(before_context, after_context) > 0` per match.
     has_context: bool,
+    /// Cached result of `is_line_by_line_fast()` computed once at construction.
+    /// Avoids repeated trait method calls (`line_terminator()`,
+    /// `non_matching_bytes()`) on every `match_by_line` invocation. The only
+    /// dynamic aspect (`stop_on_nonmatch && has_matched`) is already handled
+    /// inside `match_by_line_fast` via `SwitchToSlow`.
+    is_fast: bool,
     /// Cached line terminator byte extracted from the config's `LineTerminator`
     /// enum once at construction. Avoids repeated enum dispatch in hot paths
     /// such as line iteration, match locating, and line counting.
@@ -58,7 +64,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
     ) -> Core<'s, M, S> {
         let line_number =
             if searcher.config.line_number { Some(1) } else { None };
-        let core = Core {
+        let mut core = Core {
             config: &searcher.config,
             matcher,
             searcher,
@@ -78,9 +84,11 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             has_context: searcher.config.max_context() > 0,
             line_term: searcher.config.line_term.as_byte(),
             is_crlf: searcher.config.line_term.is_crlf(),
+            is_fast: false,
         };
         if !core.searcher.multi_line_with_matcher(&core.matcher) {
-            if core.is_line_by_line_fast() {
+            core.is_fast = core.is_line_by_line_fast();
+            if core.is_fast {
                 log::trace!("searcher core: will use fast line searcher");
             } else {
                 log::trace!("searcher core: will use slow line searcher");
@@ -188,7 +196,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         &mut self,
         buf: &[u8],
     ) -> Result<bool, S::Error> {
-        if self.is_line_by_line_fast() {
+        if self.is_fast {
             match self.match_by_line_fast(buf)? {
                 FastMatchResult::SwitchToSlow => self.match_by_line_slow(buf),
                 FastMatchResult::Continue => Ok(true),

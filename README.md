@@ -1,6 +1,6 @@
 blitzgrep
 ------------
-blitzgrep is a (faster) fork of ripgrep 
+blitzgrep is a (faster) fork of ripgrep optimized for ARM (Apple M-series architecture)
 
 ripgrep is a line-oriented search tool that recursively searches the current
 directory for a regex pattern. By default, ripgrep will respect gitignore rules

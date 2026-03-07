@@ -1,6 +1,6 @@
 blitzgrep
 ------------
-blitzgrep is a (faster) fork of ripgrep optimized for ARM (Apple M-series architecture)
+blitzgrep is a fork of ripgrep optimized for ARM (Apple M-series architecture). it is designed as a drop-in replacement.
 
 developed by byzantinelabs.ai team
 

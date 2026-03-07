@@ -996,14 +996,10 @@ impl Searcher {
             return Err(S::Error::error_io(alloc_error(heap_limit)));
         }
 
-        // Pre-allocate capacity up to the heap limit to avoid repeated
-        // reallocations during buffer growth. We reserve capacity once
-        // upfront, then grow the initialized portion as needed. This
-        // avoids the O(n) copy cost of repeated Vec reallocations that
-        // the previous doubling strategy incurred.
-        let initial = cmp::min(DEFAULT_BUFFER_CAPACITY, heap_limit);
-        buf.reserve(heap_limit);
-        buf.resize(initial, 0);
+        // ... otherwise we need to roll our own. This is likely quite a bit
+        // slower than what is optimal, but we avoid worry about memory safety
+        // until there's a compelling reason to speed this up.
+        buf.resize(cmp::min(DEFAULT_BUFFER_CAPACITY, heap_limit), 0);
         let mut pos = 0;
         loop {
             let nread = match read_from.read(&mut buf[pos..]) {
@@ -1014,20 +1010,19 @@ impl Searcher {
                 Err(err) => return Err(S::Error::error_io(err)),
             };
             if nread == 0 {
-                buf.truncate(pos);
+                buf.resize(pos, 0);
                 return Ok(());
             }
 
             pos += nread;
-            if pos == buf.len() {
-                if buf.len() >= heap_limit {
+            if buf[pos..].is_empty() {
+                let additional = heap_limit - buf.len();
+                if additional == 0 {
                     return Err(S::Error::error_io(alloc_error(heap_limit)));
                 }
-                // Double the initialized region, capped at heap_limit.
-                // Since we already reserved full capacity upfront, this
-                // resize only zero-fills without reallocating.
-                let new_len = cmp::min(2 * buf.len(), heap_limit);
-                buf.resize(new_len, 0);
+                let limit = buf.len() + additional;
+                let doubled = 2 * buf.len();
+                buf.resize(cmp::min(doubled, limit), 0);
             }
         }
     }

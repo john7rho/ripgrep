@@ -520,7 +520,6 @@ impl<W: WriteColor> Standard<W> {
             hyperlink::Interpolator::new(&self.config.hyperlink);
         let stats = if self.config.stats { Some(Stats::new()) } else { None };
         let needs_match_granularity = self.needs_match_granularity();
-        let needs_all_matches = self.needs_all_matches();
         StandardSink {
             matcher,
             standard: self,
@@ -532,7 +531,6 @@ impl<W: WriteColor> Standard<W> {
             binary_byte_offset: None,
             stats,
             needs_match_granularity,
-            needs_all_matches,
         }
     }
 
@@ -558,7 +556,6 @@ impl<W: WriteColor> Standard<W> {
         let ppath = PrinterPath::new(path.as_ref())
             .with_separator(self.config.separator_path);
         let needs_match_granularity = self.needs_match_granularity();
-        let needs_all_matches = self.needs_all_matches();
         StandardSink {
             matcher,
             standard: self,
@@ -570,7 +567,6 @@ impl<W: WriteColor> Standard<W> {
             binary_byte_offset: None,
             stats,
             needs_match_granularity,
-            needs_all_matches,
         }
     }
 
@@ -595,20 +591,6 @@ impl<W: WriteColor> Standard<W> {
         || self.config.only_matching
         // Computing certain statistics requires finding each match.
         || self.config.stats
-    }
-
-    /// Returns true when all matches must be found. When false but
-    /// `needs_match_granularity` is true, only the first match is needed
-    /// (e.g., for `--column` without coloring or other per-match features).
-    fn needs_all_matches(&self) -> bool {
-        let supports_color = self.wtr.borrow().supports_color();
-        let match_colored = !self.config.colors.matched().is_none();
-
-        (supports_color && match_colored)
-            || self.config.replacement.is_some()
-            || self.config.per_match
-            || self.config.only_matching
-            || self.config.stats
     }
 }
 
@@ -665,7 +647,6 @@ pub struct StandardSink<'p, 's, M: Matcher, W> {
     binary_byte_offset: Option<u64>,
     stats: Option<Stats>,
     needs_match_granularity: bool,
-    needs_all_matches: bool,
 }
 
 impl<'p, 's, M: Matcher, W: WriteColor> StandardSink<'p, 's, M, W> {
@@ -732,7 +713,6 @@ impl<'p, 's, M: Matcher, W: WriteColor> StandardSink<'p, 's, M, W> {
         // one search to find the matches (well, for replacements, we do one
         // additional search to perform the actual replacement).
         let matches = &mut self.standard.matches;
-        let needs_all = self.needs_all_matches;
         find_iter_at_in_context(
             searcher,
             &self.matcher,
@@ -741,9 +721,7 @@ impl<'p, 's, M: Matcher, W: WriteColor> StandardSink<'p, 's, M, W> {
             |m| {
                 let (s, e) = (m.start() - range.start, m.end() - range.start);
                 matches.push(Match::new(s, e));
-                // When only the first match is needed (e.g., for --column
-                // without coloring), stop after finding it.
-                needs_all
+                true
             },
         )?;
         // Don't report empty matches appearing at the end of the bytes.
@@ -1138,40 +1116,27 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         let line_term = self.searcher.line_terminator().as_byte();
         let spec = self.config().colors.matched();
         let bytes = self.sunk.bytes();
-
-        // Precompute line boundaries once to avoid re-walking all lines
-        // from the beginning for each match. This turns O(N*M) line
-        // stepping into O(N+M) where N = matches and M = lines.
-        let mut lines: Vec<Match> = Vec::new();
-        let mut stepper = LineStep::new(line_term, 0, bytes.len());
-        while let Some((start, end)) = stepper.next(bytes) {
-            lines.push(Match::new(start, end));
-        }
-
         for &m in self.sunk.matches() {
-            // Reset to beginning for each match since matches may
-            // overlap with earlier lines (matches are sorted but
-            // per_match needs to emit from the first overlapping line).
-            let mut li = 0;
-            while li < lines.len() {
-                let line = lines[li];
+            let mut count = 0;
+            let mut stepper = LineStep::new(line_term, 0, bytes.len());
+            while let Some((start, end)) = stepper.next(bytes) {
+                let mut line = Match::new(start, end);
                 if line.start() >= m.end() {
                     break;
                 } else if line.end() <= m.start() {
-                    li += 1;
+                    count += 1;
                     continue;
                 }
                 self.write_prelude(
                     self.sunk.absolute_byte_offset() + line.start() as u64,
-                    self.sunk.line_number().map(|n| n + li as u64),
+                    self.sunk.line_number().map(|n| n + count),
                     Some(m.start().saturating_sub(line.start()) as u64 + 1),
                 )?;
-                let mut line = line;
+                count += 1;
                 self.trim_line_terminator(bytes, &mut line);
                 self.trim_ascii_prefix(bytes, &mut line);
                 if self.exceeds_max_columns(&bytes[line]) {
                     self.write_exceeded_line(bytes, line, &[m], &mut 0)?;
-                    li += 1;
                     continue;
                 }
 
@@ -1199,7 +1164,6 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
                 if self.config().per_match_one_line {
                     break;
                 }
-                li += 1;
             }
         }
         Ok(())

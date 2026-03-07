@@ -69,17 +69,6 @@ impl Default for BinaryDetection {
     }
 }
 
-impl BinaryDetection {
-    /// Returns true if and only if the detection heuristic demands that
-    /// the line buffer stop read data once binary data is observed.
-    fn is_quit(&self) -> bool {
-        match *self {
-            BinaryDetection::Quit(_) => true,
-            _ => false,
-        }
-    }
-}
-
 /// The configuration of a buffer. This contains options that are fixed once
 /// a buffer has been constructed.
 #[derive(Clone, Copy, Debug)]
@@ -92,6 +81,11 @@ struct Config {
     buffer_alloc: BufferAllocation,
     /// When set, the presence of the given byte indicates binary content.
     binary: BinaryDetection,
+    /// Cached byte from `binary`, if detection is enabled. Avoids enum
+    /// dispatch in the hot `fill` loop.
+    binary_byte: Option<u8>,
+    /// Cached flag: true when binary detection uses the "quit" strategy.
+    binary_is_quit: bool,
 }
 
 impl Default for Config {
@@ -101,6 +95,29 @@ impl Default for Config {
             lineterm: b'\n',
             buffer_alloc: BufferAllocation::default(),
             binary: BinaryDetection::default(),
+            binary_byte: None,
+            binary_is_quit: false,
+        }
+    }
+}
+
+impl Config {
+    /// Synchronize the cached `binary_byte` and `binary_is_quit` fields
+    /// from the `binary` enum. Must be called after changing `binary`.
+    fn set_binary_cache(&mut self) {
+        match self.binary {
+            BinaryDetection::None => {
+                self.binary_byte = None;
+                self.binary_is_quit = false;
+            }
+            BinaryDetection::Quit(b) => {
+                self.binary_byte = Some(b);
+                self.binary_is_quit = true;
+            }
+            BinaryDetection::Convert(b) => {
+                self.binary_byte = Some(b);
+                self.binary_is_quit = false;
+            }
         }
     }
 }
@@ -198,6 +215,7 @@ impl LineBufferBuilder {
         detection: BinaryDetection,
     ) -> &mut LineBufferBuilder {
         self.config.binary = detection;
+        self.config.set_binary_cache();
         self
     }
 }
@@ -329,6 +347,7 @@ impl LineBuffer {
     /// an existing line buffer without needing to create a new one.
     pub(crate) fn set_binary_detection(&mut self, binary: BinaryDetection) {
         self.config.binary = binary;
+        self.config.set_binary_cache();
     }
 
     /// Reset this buffer, such that it can be used with a new reader.
@@ -407,7 +426,7 @@ impl LineBuffer {
         // If the binary detection heuristic tells us to quit once binary data
         // has been observed, then we no longer read new data and reach EOF
         // once the current buffer has been consumed.
-        if self.config.binary.is_quit() && self.binary_byte_offset.is_some() {
+        if self.config.binary_is_quit && self.binary_byte_offset.is_some() {
             return Ok(!self.buffer().is_empty());
         }
 
@@ -431,11 +450,11 @@ impl LineBuffer {
             self.end += readlen;
             let newbytes = &mut self.buf[oldend..self.end];
 
-            // Binary detection.
-            match self.config.binary {
-                BinaryDetection::None => {} // nothing to do
-                BinaryDetection::Quit(byte) => {
-                    if let Some(i) = newbytes.find_byte(byte) {
+            // Binary detection, using cached byte/mode to avoid per-fill
+            // enum dispatch.
+            if let Some(binary_byte) = self.config.binary_byte {
+                if self.config.binary_is_quit {
+                    if let Some(i) = newbytes.find_byte(binary_byte) {
                         self.end = oldend + i;
                         self.last_lineterm = self.end;
                         self.binary_byte_offset =
@@ -445,18 +464,15 @@ impl LineBuffer {
                         // such to the caller.
                         return Ok(self.pos < self.end);
                     }
-                }
-                BinaryDetection::Convert(byte) => {
-                    if let Some(i) =
-                        replace_bytes(newbytes, byte, self.config.lineterm)
-                    {
-                        // Record only the first binary offset.
-                        if self.binary_byte_offset.is_none() {
-                            self.binary_byte_offset = Some(
-                                self.absolute_byte_offset
-                                    + (oldend + i) as u64,
-                            );
-                        }
+                } else if let Some(i) =
+                    replace_bytes(newbytes, binary_byte, self.config.lineterm)
+                {
+                    // Record only the first binary offset.
+                    if self.binary_byte_offset.is_none() {
+                        self.binary_byte_offset = Some(
+                            self.absolute_byte_offset
+                                + (oldend + i) as u64,
+                        );
                     }
                 }
             }

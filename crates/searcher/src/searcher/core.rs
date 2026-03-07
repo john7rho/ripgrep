@@ -34,6 +34,12 @@ pub(crate) struct Core<'s, M: 's, S> {
     has_sunk: bool,
     has_matched: bool,
     count: u64,
+    /// Cached flag: true when a match limit is configured.
+    /// Avoids an `Option` branch on every iteration of the inner search loop.
+    has_max_matches: bool,
+    /// Cached flag: true when any context (before or after) is configured.
+    /// Avoids recomputing `max(before_context, after_context) > 0` per match.
+    has_context: bool,
 }
 
 impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
@@ -61,6 +67,8 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             has_sunk: false,
             has_matched: false,
             count: 0,
+            has_max_matches: searcher.config.max_matches.is_some(),
+            has_context: searcher.config.max_context() > 0,
         };
         if !core.searcher.multi_line_with_matcher(&core.matcher) {
             if core.is_line_by_line_fast() {
@@ -389,6 +397,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         use FastMatchResult::*;
 
         debug_assert!(!self.config.passthru);
+        let has_context = self.has_context;
         while !buf[self.pos()..].is_empty() {
             if self.config.stop_on_nonmatch && self.has_matched {
                 return Ok(SwitchToSlow);
@@ -400,7 +409,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             } else if let Some(line) = self.find_by_line_fast(buf)? {
                 self.has_matched = true;
                 self.increment_count();
-                if self.config.max_context() > 0 {
+                if has_context {
                     if !self.after_context_by_line(buf, line.start())? {
                         return Ok(Stop);
                     }
@@ -416,8 +425,10 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                 break;
             }
         }
-        if !self.after_context_by_line(buf, buf.len())? {
-            return Ok(Stop);
+        if has_context {
+            if !self.after_context_by_line(buf, buf.len())? {
+                return Ok(Stop);
+            }
         }
         if self.has_exceeded_match_limit() && self.after_context_left == 0 {
             return Ok(Stop);
@@ -707,7 +718,9 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         false
     }
 
+    #[inline(always)]
     fn has_exceeded_match_limit(&self) -> bool {
-        self.config.max_matches.map_or(false, |limit| self.count() >= limit)
+        self.has_max_matches
+            && self.config.max_matches.unwrap() <= self.count()
     }
 }

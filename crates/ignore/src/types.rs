@@ -236,6 +236,7 @@ impl Types {
     }
 
     /// Returns true if and only if this matcher has zero selections.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.selections.is_empty()
     }
@@ -258,6 +259,7 @@ impl Types {
     /// The path is considered ignored if it matches a negated file type.
     /// If at least one file type is selected and `path` doesn't match, then
     /// the path is also considered ignored.
+    #[inline]
     pub fn matched<'a, P: AsRef<Path>>(
         &'a self,
         path: P,

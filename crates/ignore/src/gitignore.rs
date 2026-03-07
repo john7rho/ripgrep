@@ -157,6 +157,7 @@ impl Gitignore {
 
     /// Returns true if and only if this gitignore has zero globs, and
     /// therefore never matches any file path.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.set.is_empty()
     }
@@ -188,6 +189,7 @@ impl Gitignore {
     /// determined by a common suffix of the directory containing this
     /// gitignore) is stripped. If there is no common suffix/prefix overlap,
     /// then `path` is assumed to be relative to this matcher.
+    #[inline]
     pub fn matched<P: AsRef<Path>>(
         &self,
         path: P,

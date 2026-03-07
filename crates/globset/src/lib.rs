@@ -339,6 +339,7 @@ impl GlobSet {
     }
 
     /// Returns true if any glob in this set matches the path given.
+    #[inline]
     pub fn is_match<P: AsRef<Path>>(&self, path: P) -> bool {
         self.is_match_candidate(&Candidate::new(path.as_ref()))
     }
@@ -347,6 +348,7 @@ impl GlobSet {
     ///
     /// This takes a Candidate as input, which can be used to amortize the
     /// cost of preparing a path for matching.
+    #[inline]
     pub fn is_match_candidate(&self, path: &Candidate<'_>) -> bool {
         if self.is_empty() {
             return false;
@@ -422,6 +424,7 @@ impl GlobSet {
     /// `into` is cleared before matching begins, and contains the set of
     /// sequence numbers (in ascending order) after matching ends. If no globs
     /// were matched, then `into` will be empty.
+    #[inline]
     pub fn matches_into<P: AsRef<Path>>(
         &self,
         path: P,
@@ -439,6 +442,7 @@ impl GlobSet {
     ///
     /// This takes a Candidate as input, which can be used to amortize the
     /// cost of preparing a path for matching.
+    #[inline]
     pub fn matches_candidate_into(
         &self,
         path: &Candidate<'_>,
@@ -614,6 +618,7 @@ impl<'a> std::fmt::Debug for Candidate<'a> {
 
 impl<'a> Candidate<'a> {
     /// Create a new candidate for matching from the given path.
+    #[inline]
     pub fn new<P: AsRef<Path> + ?Sized>(path: &'a P) -> Candidate<'a> {
         Self::from_cow(Vec::from_path_lossy(path.as_ref()))
     }
@@ -626,10 +631,12 @@ impl<'a> Candidate<'a> {
     /// invalid UTF-8. However, if the bytes are in some other encoding that
     /// isn't ASCII compatible (for example, UTF-16), then the results of
     /// matching are unspecified.
+    #[inline]
     pub fn from_bytes<P: AsRef<[u8]> + ?Sized>(path: &'a P) -> Candidate<'a> {
         Self::from_cow(Cow::Borrowed(path.as_ref()))
     }
 
+    #[inline]
     fn from_cow(path: Cow<'a, [u8]>) -> Candidate<'a> {
         let path = normalize_path(path);
         let basename = file_name(&path).unwrap_or(Cow::Borrowed(B("")));
@@ -637,10 +644,12 @@ impl<'a> Candidate<'a> {
         Candidate { path, basename, ext }
     }
 
+    #[inline]
     fn path_prefix(&self, max: usize) -> &[u8] {
         if self.path.len() <= max { &*self.path } else { &self.path[..max] }
     }
 
+    #[inline]
     fn path_suffix(&self, max: usize) -> &[u8] {
         if self.path.len() <= max {
             &*self.path
@@ -662,6 +671,7 @@ enum GlobSetMatchStrategy {
 }
 
 impl GlobSetMatchStrategy {
+    #[inline]
     fn is_match(&self, candidate: &Candidate<'_>) -> bool {
         use self::GlobSetMatchStrategy::*;
         match *self {
@@ -675,6 +685,7 @@ impl GlobSetMatchStrategy {
         }
     }
 
+    #[inline]
     fn matches_into(
         &self,
         candidate: &Candidate<'_>,
@@ -705,6 +716,7 @@ impl LiteralStrategy {
         self.0.entry(lit.into_bytes()).or_insert(vec![]).push(global_index);
     }
 
+    #[inline]
     fn is_match(&self, candidate: &Candidate<'_>) -> bool {
         self.0.contains_key(candidate.path.as_bytes())
     }
@@ -733,6 +745,7 @@ impl BasenameLiteralStrategy {
         self.0.entry(lit.into_bytes()).or_insert(vec![]).push(global_index);
     }
 
+    #[inline]
     fn is_match(&self, candidate: &Candidate<'_>) -> bool {
         if candidate.basename.is_empty() {
             return false;
@@ -767,6 +780,7 @@ impl ExtensionStrategy {
         self.0.entry(ext.into_bytes()).or_insert(vec![]).push(global_index);
     }
 
+    #[inline]
     fn is_match(&self, candidate: &Candidate<'_>) -> bool {
         if candidate.ext.is_empty() {
             return false;
@@ -797,6 +811,7 @@ struct PrefixStrategy {
 }
 
 impl PrefixStrategy {
+    #[inline]
     fn is_match(&self, candidate: &Candidate<'_>) -> bool {
         let path = candidate.path_prefix(self.longest);
         for m in self.matcher.find_overlapping_iter(path) {
@@ -829,6 +844,7 @@ struct SuffixStrategy {
 }
 
 impl SuffixStrategy {
+    #[inline]
     fn is_match(&self, candidate: &Candidate<'_>) -> bool {
         let path = candidate.path_suffix(self.longest);
         for m in self.matcher.find_overlapping_iter(path) {
@@ -857,6 +873,7 @@ impl SuffixStrategy {
 struct RequiredExtensionStrategy(fnv::HashMap<Vec<u8>, Vec<(usize, Regex)>>);
 
 impl RequiredExtensionStrategy {
+    #[inline]
     fn is_match(&self, candidate: &Candidate<'_>) -> bool {
         if candidate.ext.is_empty() {
             return false;
@@ -912,6 +929,7 @@ type PatternSetPoolFn =
     Box<dyn Fn() -> PatternSet + Send + Sync + UnwindSafe + RefUnwindSafe>;
 
 impl RegexSetStrategy {
+    #[inline]
     fn is_match(&self, candidate: &Candidate<'_>) -> bool {
         self.matcher.is_match(candidate.path.as_bytes())
     }

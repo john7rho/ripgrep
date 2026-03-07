@@ -421,6 +421,7 @@ pub enum Match<T> {
 
 impl<T> Match<T> {
     /// Returns true if the match result didn't match any globs.
+    #[inline]
     pub fn is_none(&self) -> bool {
         match *self {
             Match::None => true,
@@ -429,6 +430,7 @@ impl<T> Match<T> {
     }
 
     /// Returns true if the match result implies the path should be ignored.
+    #[inline]
     pub fn is_ignore(&self) -> bool {
         match *self {
             Match::Ignore(_) => true,
@@ -438,6 +440,7 @@ impl<T> Match<T> {
 
     /// Returns true if the match result implies the path should be
     /// whitelisted.
+    #[inline]
     pub fn is_whitelist(&self) -> bool {
         match *self {
             Match::Whitelist(_) => true,
@@ -447,6 +450,7 @@ impl<T> Match<T> {
 
     /// Inverts the match so that `Ignore` becomes `Whitelist` and
     /// `Whitelist` becomes `Ignore`. A non-match remains the same.
+    #[inline]
     pub fn invert(self) -> Match<T> {
         match self {
             Match::None => Match::None,
@@ -467,6 +471,7 @@ impl<T> Match<T> {
     /// Apply the given function to the value inside this match.
     ///
     /// If the match has no value, then return the match unchanged.
+    #[inline]
     pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Match<U> {
         match self {
             Match::None => Match::None,
@@ -476,6 +481,7 @@ impl<T> Match<T> {
     }
 
     /// Return the match if it is not none. Otherwise, return other.
+    #[inline]
     pub fn or(self, other: Self) -> Self {
         if self.is_none() { other } else { self }
     }

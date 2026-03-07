@@ -62,6 +62,7 @@ impl Override {
     /// Returns true if and only if this matcher is empty.
     ///
     /// When a matcher is empty, it will never match any file path.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -94,6 +95,7 @@ impl Override {
     /// given) is stripped. If there is no common suffix/prefix overlap, then
     /// `path` is assumed to reside in the same directory as the root path for
     /// this set of overrides.
+    #[inline]
     pub fn matched<'a, P: AsRef<Path>>(
         &'a self,
         path: P,

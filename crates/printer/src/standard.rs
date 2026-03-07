@@ -927,17 +927,18 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
 
     fn sink(&self) -> io::Result<()> {
         self.write_search_prelude()?;
+        let wtr = &mut *self.wtr().borrow_mut();
         if self.sunk.matches().is_empty() {
             if self.multi_line() && !self.is_context() {
-                self.sink_fast_multi_line()
+                self.sink_fast_multi_line(wtr)
             } else {
-                self.sink_fast()
+                self.sink_fast(wtr)
             }
         } else {
             if self.multi_line() && !self.is_context() {
-                self.sink_slow_multi_line()
+                self.sink_slow_multi_line(wtr)
             } else {
-                self.sink_slow()
+                self.sink_slow(wtr)
             }
         }
     }
@@ -948,16 +949,17 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
     ///
     /// This should only be used when the configuration does not demand match
     /// granularity and the searcher is not in multi line mode.
-    fn sink_fast(&self) -> io::Result<()> {
+    fn sink_fast(&self, wtr: &mut CounterWriter<W>) -> io::Result<()> {
         debug_assert!(self.sunk.matches().is_empty());
         debug_assert!(!self.multi_line() || self.is_context());
 
         self.write_prelude(
+            wtr,
             self.sunk.absolute_byte_offset(),
             self.sunk.line_number(),
             None,
         )?;
-        self.write_line(self.sunk.bytes())
+        self.write_line(wtr, self.sunk.bytes())
     }
 
     /// Print matches (possibly spanning more than one line) quickly by
@@ -966,7 +968,7 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
     ///
     /// This should only be used when the configuration does not demand match
     /// granularity. This may be used when the searcher is in multi line mode.
-    fn sink_fast_multi_line(&self) -> io::Result<()> {
+    fn sink_fast_multi_line(&self, wtr: &mut CounterWriter<W>) -> io::Result<()> {
         debug_assert!(self.sunk.matches().is_empty());
         // This isn't actually a required invariant for using this method,
         // but if we wind up here and multi line mode is disabled, then we
@@ -978,62 +980,66 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         let mut absolute_byte_offset = self.sunk.absolute_byte_offset();
         for (i, line) in self.sunk.lines(line_term).enumerate() {
             self.write_prelude(
+                wtr,
                 absolute_byte_offset,
                 self.sunk.line_number().map(|n| n + i as u64),
                 None,
             )?;
             absolute_byte_offset += line.len() as u64;
 
-            self.write_line(line)?;
+            self.write_line(wtr, line)?;
         }
         Ok(())
     }
 
     /// Print a matching line where the configuration of the printer requires
     /// finding each individual match (e.g., for coloring).
-    fn sink_slow(&self) -> io::Result<()> {
+    fn sink_slow(&self, wtr: &mut CounterWriter<W>) -> io::Result<()> {
         debug_assert!(!self.sunk.matches().is_empty());
         debug_assert!(!self.multi_line() || self.is_context());
 
         if self.config().only_matching {
             for &m in self.sunk.matches() {
                 self.write_prelude(
+                    wtr,
                     self.sunk.absolute_byte_offset() + m.start() as u64,
                     self.sunk.line_number(),
                     Some(m.start() as u64 + 1),
                 )?;
 
                 let buf = &self.sunk.bytes()[m];
-                self.write_colored_line(&[Match::new(0, buf.len())], buf)?;
+                self.write_colored_line(wtr, &[Match::new(0, buf.len())], buf)?;
             }
         } else if self.config().per_match {
             for &m in self.sunk.matches() {
                 self.write_prelude(
+                    wtr,
                     self.sunk.absolute_byte_offset() + m.start() as u64,
                     self.sunk.line_number(),
                     Some(m.start() as u64 + 1),
                 )?;
-                self.write_colored_line(&[m], self.sunk.bytes())?;
+                self.write_colored_line(wtr, &[m], self.sunk.bytes())?;
             }
         } else {
             self.write_prelude(
+                wtr,
                 self.sunk.absolute_byte_offset(),
                 self.sunk.line_number(),
                 Some(self.sunk.matches()[0].start() as u64 + 1),
             )?;
-            self.write_colored_line(self.sunk.matches(), self.sunk.bytes())?;
+            self.write_colored_line(wtr, self.sunk.matches(), self.sunk.bytes())?;
         }
         Ok(())
     }
 
-    fn sink_slow_multi_line(&self) -> io::Result<()> {
+    fn sink_slow_multi_line(&self, wtr: &mut CounterWriter<W>) -> io::Result<()> {
         debug_assert!(!self.sunk.matches().is_empty());
         debug_assert!(self.multi_line());
 
         if self.config().only_matching {
-            return self.sink_slow_multi_line_only_matching();
+            return self.sink_slow_multi_line_only_matching(wtr);
         } else if self.config().per_match {
-            return self.sink_slow_multi_per_match();
+            return self.sink_slow_multi_per_match(wtr);
         }
 
         let line_term = self.searcher.line_terminator().as_byte();
@@ -1045,6 +1051,7 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         while let Some((start, end)) = stepper.next(bytes) {
             let mut line = Match::new(start, end);
             self.write_prelude(
+                wtr,
                 self.sunk.absolute_byte_offset() + line.start() as u64,
                 self.sunk.line_number().map(|n| n + count),
                 Some(matches[0].start() as u64 + 1),
@@ -1052,16 +1059,16 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
             count += 1;
             self.trim_ascii_prefix(bytes, &mut line);
             if self.exceeds_max_columns(&bytes[line]) {
-                self.write_exceeded_line(bytes, line, matches, &mut midx)?;
+                self.write_exceeded_line(wtr, bytes, line, matches, &mut midx)?;
             } else {
-                self.write_colored_matches(bytes, line, matches, &mut midx)?;
-                self.write_line_term()?;
+                self.write_colored_matches(wtr, bytes, line, matches, &mut midx)?;
+                self.write_line_term(wtr)?;
             }
         }
         Ok(())
     }
 
-    fn sink_slow_multi_line_only_matching(&self) -> io::Result<()> {
+    fn sink_slow_multi_line_only_matching(&self, wtr: &mut CounterWriter<W>) -> io::Result<()> {
         let line_term = self.searcher.line_terminator().as_byte();
         let spec = self.config().colors.matched();
         let bytes = self.sunk.bytes();
@@ -1090,6 +1097,7 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
                 } else {
                     let upto = cmp::min(line.end(), m.end());
                     self.write_prelude(
+                        wtr,
                         self.sunk.absolute_byte_offset() + m.start() as u64,
                         self.sunk.line_number().map(|n| n + count),
                         Some(m.start() as u64 + 1),
@@ -1099,11 +1107,11 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
                     line = line.with_start(upto);
                     if self.exceeds_max_columns(&bytes[this_line]) {
                         self.write_exceeded_line(
-                            bytes, this_line, matches, &mut midx,
+                            wtr, bytes, this_line, matches, &mut midx,
                         )?;
                     } else {
-                        self.write_spec(spec, &bytes[this_line])?;
-                        self.write_line_term()?;
+                        self.write_spec(wtr, spec, &bytes[this_line])?;
+                        self.write_line_term(wtr)?;
                     }
                 }
             }
@@ -1112,7 +1120,7 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         Ok(())
     }
 
-    fn sink_slow_multi_per_match(&self) -> io::Result<()> {
+    fn sink_slow_multi_per_match(&self, wtr: &mut CounterWriter<W>) -> io::Result<()> {
         let line_term = self.searcher.line_terminator().as_byte();
         let spec = self.config().colors.matched();
         let bytes = self.sunk.bytes();
@@ -1128,6 +1136,7 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
                     continue;
                 }
                 self.write_prelude(
+                    wtr,
                     self.sunk.absolute_byte_offset() + line.start() as u64,
                     self.sunk.line_number().map(|n| n + count),
                     Some(m.start().saturating_sub(line.start()) as u64 + 1),
@@ -1136,25 +1145,25 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
                 self.trim_line_terminator(bytes, &mut line);
                 self.trim_ascii_prefix(bytes, &mut line);
                 if self.exceeds_max_columns(&bytes[line]) {
-                    self.write_exceeded_line(bytes, line, &[m], &mut 0)?;
+                    self.write_exceeded_line(wtr, bytes, line, &[m], &mut 0)?;
                     continue;
                 }
 
                 while !line.is_empty() {
                     if m.end() <= line.start() {
-                        self.write(&bytes[line])?;
+                        wtr.write_all(&bytes[line])?;
                         line = line.with_start(line.end());
                     } else if line.start() < m.start() {
                         let upto = cmp::min(line.end(), m.start());
-                        self.write(&bytes[line.with_end(upto)])?;
+                        wtr.write_all(&bytes[line.with_end(upto)])?;
                         line = line.with_start(upto);
                     } else {
                         let upto = cmp::min(line.end(), m.end());
-                        self.write_spec(spec, &bytes[line.with_end(upto)])?;
+                        self.write_spec(wtr, spec, &bytes[line.with_end(upto)])?;
                         line = line.with_start(upto);
                     }
                 }
-                self.write_line_term()?;
+                self.write_line_term(wtr)?;
                 // It turns out that vimgrep really only wants one line per
                 // match, even when a match spans multiple lines. So when
                 // that option is enabled, we just quit after printing the
@@ -1175,21 +1184,22 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
     #[inline(always)]
     fn write_prelude(
         &self,
+        wtr: &mut CounterWriter<W>,
         absolute_byte_offset: u64,
         line_number: Option<u64>,
         column: Option<u64>,
     ) -> io::Result<()> {
         let mut prelude = PreludeWriter::new(self);
-        prelude.start(line_number, column)?;
-        prelude.write_path()?;
-        prelude.write_line_number(line_number)?;
-        prelude.write_column_number(column)?;
-        prelude.write_byte_offset(absolute_byte_offset)?;
-        prelude.end()
+        prelude.start(wtr, line_number, column)?;
+        prelude.write_path(wtr)?;
+        prelude.write_line_number(wtr, line_number)?;
+        prelude.write_column_number(wtr, column)?;
+        prelude.write_byte_offset(wtr, absolute_byte_offset)?;
+        prelude.end(wtr)
     }
 
     #[inline(always)]
-    fn write_line(&self, line: &[u8]) -> io::Result<()> {
+    fn write_line(&self, wtr: &mut CounterWriter<W>, line: &[u8]) -> io::Result<()> {
         let line = if !self.config().trim_ascii {
             line
         } else {
@@ -1201,16 +1211,16 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         if self.exceeds_max_columns(line) {
             let range = Match::new(0, line.len());
             self.write_exceeded_line(
+                wtr,
                 line,
                 range,
                 self.sunk.matches(),
                 &mut 0,
             )?;
         } else {
-            // self.write_trim(line)?;
-            self.write(line)?;
+            wtr.write_all(line)?;
             if !self.has_line_terminator(line) {
-                self.write_line_term()?;
+                self.write_line_term(wtr)?;
             }
         }
         Ok(())
@@ -1218,22 +1228,23 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
 
     fn write_colored_line(
         &self,
+        wtr: &mut CounterWriter<W>,
         matches: &[Match],
         bytes: &[u8],
     ) -> io::Result<()> {
         // If we know we aren't going to emit color, then we can go faster.
         let spec = self.config().colors.matched();
-        if !self.wtr().borrow().supports_color() || spec.is_none() {
-            return self.write_line(bytes);
+        if !wtr.supports_color() || spec.is_none() {
+            return self.write_line(wtr, bytes);
         }
 
         let mut line = Match::new(0, bytes.len());
         self.trim_ascii_prefix(bytes, &mut line);
         if self.exceeds_max_columns(bytes) {
-            self.write_exceeded_line(bytes, line, matches, &mut 0)
+            self.write_exceeded_line(wtr, bytes, line, matches, &mut 0)
         } else {
-            self.write_colored_matches(bytes, line, matches, &mut 0)?;
-            self.write_line_term()?;
+            self.write_colored_matches(wtr, bytes, line, matches, &mut 0)?;
+            self.write_line_term(wtr)?;
             Ok(())
         }
     }
@@ -1246,6 +1257,7 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
     /// then only the part of the match within `line` (if any) is printed.
     fn write_colored_matches(
         &self,
+        wtr: &mut CounterWriter<W>,
         bytes: &[u8],
         mut line: Match,
         matches: &[Match],
@@ -1253,18 +1265,18 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
     ) -> io::Result<()> {
         self.trim_line_terminator(bytes, &mut line);
         if matches.is_empty() {
-            self.write(&bytes[line])?;
+            wtr.write_all(&bytes[line])?;
             return Ok(());
         }
-        self.start_line_highlight()?;
+        self.start_line_highlight(wtr)?;
         while !line.is_empty() {
             if matches[*match_index].end() <= line.start() {
                 if *match_index + 1 < matches.len() {
                     *match_index += 1;
                     continue;
                 } else {
-                    self.end_color_match()?;
-                    self.write(&bytes[line])?;
+                    self.end_color_match(wtr)?;
+                    wtr.write_all(&bytes[line])?;
                     break;
                 }
             }
@@ -1272,23 +1284,24 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
             let m = matches[*match_index];
             if line.start() < m.start() {
                 let upto = cmp::min(line.end(), m.start());
-                self.end_color_match()?;
-                self.write(&bytes[line.with_end(upto)])?;
+                self.end_color_match(wtr)?;
+                wtr.write_all(&bytes[line.with_end(upto)])?;
                 line = line.with_start(upto);
             } else {
                 let upto = cmp::min(line.end(), m.end());
-                self.start_color_match()?;
-                self.write(&bytes[line.with_end(upto)])?;
+                self.start_color_match(wtr)?;
+                wtr.write_all(&bytes[line.with_end(upto)])?;
                 line = line.with_start(upto);
             }
         }
-        self.end_color_match()?;
-        self.end_line_highlight()?;
+        self.end_color_match(wtr)?;
+        self.end_line_highlight(wtr)?;
         Ok(())
     }
 
     fn write_exceeded_line(
         &self,
+        wtr: &mut CounterWriter<W>,
         bytes: &[u8],
         mut line: Match,
         matches: &[Match],
@@ -1304,10 +1317,10 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
                 .unwrap_or(0)
                 + line.start();
             line = line.with_end(end);
-            self.write_colored_matches(bytes, line, matches, match_index)?;
+            self.write_colored_matches(wtr, bytes, line, matches, match_index)?;
 
             if matches.is_empty() {
-                self.write(b" [... omitted end of long line]")?;
+                wtr.write_all(b" [... omitted end of long line]")?;
             } else {
                 let remaining = matches
                     .iter()
@@ -1317,37 +1330,37 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
                     .count();
                 let tense = if remaining == 1 { "match" } else { "matches" };
                 write!(
-                    self.wtr().borrow_mut(),
+                    wtr,
                     " [... {} more {}]",
                     remaining,
                     tense,
                 )?;
             }
-            self.write_line_term()?;
+            self.write_line_term(wtr)?;
             return Ok(());
         }
         if self.sunk.original_matches().is_empty() {
             if self.is_context() {
-                self.write(b"[Omitted long context line]")?;
+                wtr.write_all(b"[Omitted long context line]")?;
             } else {
-                self.write(b"[Omitted long matching line]")?;
+                wtr.write_all(b"[Omitted long matching line]")?;
             }
         } else {
             if self.config().only_matching {
                 if self.is_context() {
-                    self.write(b"[Omitted long context line]")?;
+                    wtr.write_all(b"[Omitted long context line]")?;
                 } else {
-                    self.write(b"[Omitted long matching line]")?;
+                    wtr.write_all(b"[Omitted long matching line]")?;
                 }
             } else {
                 write!(
-                    self.wtr().borrow_mut(),
+                    wtr,
                     "[Omitted long line with {} matches]",
                     self.sunk.original_matches().len(),
                 )?;
             }
         }
-        self.write_line_term()?;
+        self.write_line_term(wtr)?;
         Ok(())
     }
 
@@ -1359,9 +1372,9 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         if let Some(path) = self.path() {
             self.write_path_hyperlink(path)?;
             if let Some(term) = self.config().path_terminator {
-                self.write(&[term])?;
+                self.wtr().borrow_mut().write_all(&[term])?;
             } else {
-                self.write_line_term()?;
+                self.wtr().borrow_mut().write_all(self.searcher.line_terminator().as_bytes())?;
             }
         }
         Ok(())
@@ -1375,8 +1388,9 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         if let Some(ref sep) = *self.config().separator_search {
             let ever_written = self.wtr().borrow().total_count() > 0;
             if ever_written {
-                self.write(sep)?;
-                self.write_line_term()?;
+                let mut wtr = self.wtr().borrow_mut();
+                wtr.write_all(sep)?;
+                wtr.write_all(self.searcher.line_terminator().as_bytes())?;
             }
         }
         if self.config().heading {
@@ -1394,7 +1408,7 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         if let Some(byte) = bin.quit_byte() {
             if let Some(path) = self.path() {
                 self.write_path_hyperlink(path)?;
-                self.write(b": ")?;
+                self.wtr().borrow_mut().write_all(b": ")?;
             }
             let remainder = format!(
                 "WARNING: stopped searching binary file after match \
@@ -1402,57 +1416,58 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
                 [byte].as_bstr(),
                 offset,
             );
-            self.write(remainder.as_bytes())?;
+            self.wtr().borrow_mut().write_all(remainder.as_bytes())?;
         } else if let Some(byte) = bin.convert_byte() {
             if let Some(path) = self.path() {
                 self.write_path_hyperlink(path)?;
-                self.write(b": ")?;
+                self.wtr().borrow_mut().write_all(b": ")?;
             }
             let remainder = format!(
                 "binary file matches (found {:?} byte around offset {})\n",
                 [byte].as_bstr(),
                 offset,
             );
-            self.write(remainder.as_bytes())?;
+            self.wtr().borrow_mut().write_all(remainder.as_bytes())?;
         }
         Ok(())
     }
 
     fn write_context_separator(&self) -> io::Result<()> {
         if let Some(ref sep) = *self.config().separator_context {
-            self.write(sep)?;
-            self.write_line_term()?;
+            let mut wtr = self.wtr().borrow_mut();
+            wtr.write_all(sep)?;
+            wtr.write_all(self.searcher.line_terminator().as_bytes())?;
         }
         Ok(())
     }
 
-    fn write_line_term(&self) -> io::Result<()> {
-        self.write(self.searcher.line_terminator().as_bytes())
+    fn write_line_term(&self, wtr: &mut CounterWriter<W>) -> io::Result<()> {
+        wtr.write_all(self.searcher.line_terminator().as_bytes())
     }
 
-    fn write_spec(&self, spec: &ColorSpec, buf: &[u8]) -> io::Result<()> {
-        let mut wtr = self.wtr().borrow_mut();
+    fn write_spec(&self, wtr: &mut CounterWriter<W>, spec: &ColorSpec, buf: &[u8]) -> io::Result<()> {
         wtr.set_color(spec)?;
         wtr.write_all(buf)?;
         wtr.reset()?;
         Ok(())
     }
 
-    fn write_path(&self, path: &PrinterPath) -> io::Result<()> {
-        let mut wtr = self.wtr().borrow_mut();
+    fn write_path(&self, wtr: &mut CounterWriter<W>, path: &PrinterPath) -> io::Result<()> {
         wtr.set_color(self.config().colors.path())?;
         wtr.write_all(path.as_bytes())?;
         wtr.reset()
     }
 
     fn write_path_hyperlink(&self, path: &PrinterPath) -> io::Result<()> {
-        let status = self.start_hyperlink(path, None, None)?;
-        self.write_path(path)?;
-        self.end_hyperlink(status)
+        let mut wtr = self.wtr().borrow_mut();
+        let status = self.start_hyperlink(&mut *wtr, path, None, None)?;
+        self.write_path(&mut *wtr, path)?;
+        self.end_hyperlink(&mut *wtr, status)
     }
 
     fn start_hyperlink(
         &self,
+        wtr: &mut CounterWriter<W>,
         path: &PrinterPath,
         line_number: Option<u64>,
         column: Option<u64>,
@@ -1462,35 +1477,34 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         };
         let values =
             hyperlink::Values::new(hyperpath).line(line_number).column(column);
-        self.sink.interpolator.begin(&values, &mut *self.wtr().borrow_mut())
+        self.sink.interpolator.begin(&values, wtr)
     }
 
     fn end_hyperlink(
         &self,
+        wtr: &mut CounterWriter<W>,
         status: hyperlink::InterpolatorStatus,
     ) -> io::Result<()> {
-        self.sink.interpolator.finish(status, &mut *self.wtr().borrow_mut())
+        self.sink.interpolator.finish(status, wtr)
     }
 
-    fn start_color_match(&self) -> io::Result<()> {
+    fn start_color_match(&self, wtr: &mut CounterWriter<W>) -> io::Result<()> {
         if self.in_color_match.get() {
             return Ok(());
         }
-        self.wtr().borrow_mut().set_color(self.config().colors.matched())?;
+        wtr.set_color(self.config().colors.matched())?;
         self.in_color_match.set(true);
         Ok(())
     }
 
-    fn end_color_match(&self) -> io::Result<()> {
+    fn end_color_match(&self, wtr: &mut CounterWriter<W>) -> io::Result<()> {
         if !self.in_color_match.get() {
             return Ok(());
         }
         if self.highlight_on() {
-            self.wtr()
-                .borrow_mut()
-                .set_color(self.config().colors.highlight())?;
+            wtr.set_color(self.config().colors.highlight())?;
         } else {
-            self.wtr().borrow_mut().reset()?;
+            wtr.reset()?;
         }
         self.in_color_match.set(false);
         Ok(())
@@ -1500,24 +1514,18 @@ impl<'a, M: Matcher, W: WriteColor> StandardImpl<'a, M, W> {
         !self.config().colors.highlight().is_none() && !self.is_context()
     }
 
-    fn start_line_highlight(&self) -> io::Result<()> {
+    fn start_line_highlight(&self, wtr: &mut CounterWriter<W>) -> io::Result<()> {
         if self.highlight_on() {
-            self.wtr()
-                .borrow_mut()
-                .set_color(self.config().colors.highlight())?;
+            wtr.set_color(self.config().colors.highlight())?;
         }
         Ok(())
     }
 
-    fn end_line_highlight(&self) -> io::Result<()> {
+    fn end_line_highlight(&self, wtr: &mut CounterWriter<W>) -> io::Result<()> {
         if self.highlight_on() {
-            self.wtr().borrow_mut().reset()?;
+            wtr.reset()?;
         }
         Ok(())
-    }
-
-    fn write(&self, buf: &[u8]) -> io::Result<()> {
-        self.wtr().borrow_mut().write_all(buf)
     }
 
     fn trim_line_terminator(&self, buf: &[u8], line: &mut Match) {
@@ -1629,6 +1637,7 @@ impl<'a, M: Matcher, W: WriteColor> PreludeWriter<'a, M, W> {
     #[inline(always)]
     fn start(
         &mut self,
+        wtr: &mut CounterWriter<W>,
         line_number: Option<u64>,
         column: Option<u64>,
     ) -> io::Result<()> {
@@ -1637,19 +1646,19 @@ impl<'a, M: Matcher, W: WriteColor> PreludeWriter<'a, M, W> {
             || !self.config().heading
         {
             self.interp_status =
-                self.std.start_hyperlink(path, line_number, column)?;
+                self.std.start_hyperlink(wtr, path, line_number, column)?;
         }
         Ok(())
     }
 
     /// Ends the prelude and writes the remaining output.
     #[inline(always)]
-    fn end(&mut self) -> io::Result<()> {
-        self.std.end_hyperlink(std::mem::replace(
+    fn end(&mut self, wtr: &mut CounterWriter<W>) -> io::Result<()> {
+        self.std.end_hyperlink(wtr, std::mem::replace(
             &mut self.interp_status,
             hyperlink::InterpolatorStatus::inactive(),
         ))?;
-        self.write_separator()
+        self.write_separator(wtr)
     }
 
     /// If this printer has a file path associated with it, then this will
@@ -1657,7 +1666,7 @@ impl<'a, M: Matcher, W: WriteColor> PreludeWriter<'a, M, W> {
     /// separator. (If a path terminator is set, then that is used instead of
     /// the field separator.)
     #[inline(always)]
-    fn write_path(&mut self) -> io::Result<()> {
+    fn write_path(&mut self, wtr: &mut CounterWriter<W>) -> io::Result<()> {
         // The prelude doesn't handle headings, only what comes before a match
         // on the same line. So if we are emitting paths in headings, we should
         // not do it here on each line.
@@ -1665,8 +1674,8 @@ impl<'a, M: Matcher, W: WriteColor> PreludeWriter<'a, M, W> {
             return Ok(());
         }
         let Some(path) = self.std.path() else { return Ok(()) };
-        self.write_separator()?;
-        self.std.write_path(path)?;
+        self.write_separator(wtr)?;
+        self.std.write_path(wtr, path)?;
 
         self.next_separator = if self.config().path_terminator.is_some() {
             PreludeSeparator::PathTerminator
@@ -1678,38 +1687,38 @@ impl<'a, M: Matcher, W: WriteColor> PreludeWriter<'a, M, W> {
 
     /// Writes the line number field if present.
     #[inline(always)]
-    fn write_line_number(&mut self, line: Option<u64>) -> io::Result<()> {
+    fn write_line_number(&mut self, wtr: &mut CounterWriter<W>, line: Option<u64>) -> io::Result<()> {
         let Some(line_number) = line else { return Ok(()) };
-        self.write_separator()?;
+        self.write_separator(wtr)?;
         let n = DecimalFormatter::new(line_number);
-        self.std.write_spec(self.config().colors.line(), n.as_bytes())?;
+        self.std.write_spec(wtr, self.config().colors.line(), n.as_bytes())?;
         self.next_separator = PreludeSeparator::FieldSeparator;
         Ok(())
     }
 
     /// Writes the column number field if present and configured to do so.
     #[inline(always)]
-    fn write_column_number(&mut self, column: Option<u64>) -> io::Result<()> {
+    fn write_column_number(&mut self, wtr: &mut CounterWriter<W>, column: Option<u64>) -> io::Result<()> {
         if !self.config().column {
             return Ok(());
         }
         let Some(column_number) = column else { return Ok(()) };
-        self.write_separator()?;
+        self.write_separator(wtr)?;
         let n = DecimalFormatter::new(column_number);
-        self.std.write_spec(self.config().colors.column(), n.as_bytes())?;
+        self.std.write_spec(wtr, self.config().colors.column(), n.as_bytes())?;
         self.next_separator = PreludeSeparator::FieldSeparator;
         Ok(())
     }
 
     /// Writes the byte offset field if configured to do so.
     #[inline(always)]
-    fn write_byte_offset(&mut self, offset: u64) -> io::Result<()> {
+    fn write_byte_offset(&mut self, wtr: &mut CounterWriter<W>, offset: u64) -> io::Result<()> {
         if !self.config().byte_offset {
             return Ok(());
         }
-        self.write_separator()?;
+        self.write_separator(wtr)?;
         let n = DecimalFormatter::new(offset);
-        self.std.write_spec(self.config().colors.column(), n.as_bytes())?;
+        self.std.write_spec(wtr, self.config().colors.column(), n.as_bytes())?;
         self.next_separator = PreludeSeparator::FieldSeparator;
         Ok(())
     }
@@ -1719,15 +1728,15 @@ impl<'a, M: Matcher, W: WriteColor> PreludeWriter<'a, M, W> {
     /// This is called before writing the contents of a field, and at
     /// the end of the prelude.
     #[inline(always)]
-    fn write_separator(&mut self) -> io::Result<()> {
+    fn write_separator(&mut self, wtr: &mut CounterWriter<W>) -> io::Result<()> {
         match self.next_separator {
             PreludeSeparator::None => {}
             PreludeSeparator::FieldSeparator => {
-                self.std.write(self.field_separator)?;
+                wtr.write_all(self.field_separator)?;
             }
             PreludeSeparator::PathTerminator => {
                 if let Some(term) = self.config().path_terminator {
-                    self.std.write(&[term])?;
+                    wtr.write_all(&[term])?;
                 }
             }
         }

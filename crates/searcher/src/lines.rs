@@ -88,7 +88,9 @@ impl LineStep {
             None => {
                 if self.pos < bytes.len() {
                     let m = (self.pos, bytes.len());
-                    assert!(m.0 <= m.1);
+                    // Safety invariant: self.pos < bytes.len() guarantees
+                    // m.0 < m.1, which implies m.0 <= m.1.
+                    debug_assert!(m.0 <= m.1);
 
                     self.pos = m.1;
                     Some(m)
@@ -98,7 +100,9 @@ impl LineStep {
             }
             Some(line_end) => {
                 let m = (self.pos, self.pos + line_end + 1);
-                assert!(m.0 <= m.1);
+                // Safety invariant: line_end is a non-negative offset,
+                // so self.pos + line_end + 1 > self.pos, i.e., m.1 > m.0.
+                debug_assert!(m.0 <= m.1);
 
                 self.pos = m.1;
                 Some(m)
@@ -115,6 +119,7 @@ pub(crate) fn count(bytes: &[u8], line_term: u8) -> u64 {
 /// Given a line that possibly ends with a terminator, return that line without
 /// the terminator.
 #[inline(always)]
+#[allow(dead_code)]
 pub(crate) fn without_terminator(
     bytes: &[u8],
     line_term: LineTerminator,

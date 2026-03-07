@@ -44,6 +44,9 @@ pub(crate) struct Core<'s, M: 's, S> {
     /// enum once at construction. Avoids repeated enum dispatch in hot paths
     /// such as line iteration, match locating, and line counting.
     line_term: u8,
+    /// Cached flag: true when the line terminator is CRLF. Used by
+    /// `strip_terminator` to avoid per-line enum dispatch on `LineTerminator`.
+    is_crlf: bool,
 }
 
 impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
@@ -74,6 +77,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             has_max_matches: searcher.config.max_matches.is_some(),
             has_context: searcher.config.max_context() > 0,
             line_term: searcher.config.line_term.as_byte(),
+            is_crlf: searcher.config.line_term.is_crlf(),
         };
         if !core.searcher.multi_line_with_matcher(&core.matcher) {
             if core.is_line_by_line_fast() {
@@ -130,7 +134,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         // like `(?m)^$` can match at the final position beyond a
         // line terminator, which is non-sensical in line oriented
         // matching.
-        let line = lines::without_terminator(line, self.config.line_term);
+        let line = self.strip_terminator(line);
         self.matcher.is_match(line).map_err(S::Error::error_message)
     }
 
@@ -361,10 +365,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                 // classes of regexes from matching the empty position *after*
                 // the end of the line. For example, `(?m)^$` will match at
                 // position (2, 2) in the string `a\n`.
-                let slice = lines::without_terminator(
-                    &buf[line],
-                    self.config.line_term,
-                );
+                let slice = self.strip_terminator(&buf[line]);
                 self.shortest_match(slice)?.is_some()
             };
             self.set_pos(line.end());
@@ -682,6 +683,30 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             *line_number += count;
             self.last_line_counted = upto;
         }
+    }
+
+    /// Strip the line terminator from the end of `line`, using pre-cached
+    /// `line_term` and `is_crlf` flags to avoid per-call enum dispatch on
+    /// `LineTerminator`. This is functionally equivalent to
+    /// `lines::without_terminator(line, self.config.line_term)` but avoids
+    /// the overhead of matching on the `LineTerminator` enum on every call.
+    #[inline(always)]
+    fn strip_terminator<'b>(&self, line: &'b [u8]) -> &'b [u8] {
+        if self.is_crlf {
+            // CRLF: strip trailing \r\n if present, otherwise return as-is.
+            if line.len() >= 2
+                && line[line.len() - 2] == b'\r'
+                && line[line.len() - 1] == b'\n'
+            {
+                return &line[..line.len() - 2];
+            }
+            return line;
+        }
+        // Single-byte terminator: strip trailing byte if it matches.
+        if line.last() == Some(&self.line_term) {
+            return &line[..line.len() - 1];
+        }
+        line
     }
 
     fn is_line_by_line_fast(&self) -> bool {

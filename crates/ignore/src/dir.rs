@@ -150,6 +150,12 @@ struct IgnoreInner {
     /// sub-directory. Cached at construction time to avoid walking the
     /// parent chain on every call to `matched_ignore`.
     has_git_ancestor: bool,
+    /// Cached flag: true when at least one of the local matchers
+    /// (custom_ignore, ignore, git_ignore, git_exclude) is non-empty.
+    /// Avoids checking four individual `Gitignore::is_empty()` calls
+    /// per parent level in the `matched_ignore` loop when this level
+    /// contributes no rules.
+    has_local_matchers: bool,
     /// Ignore config.
     opts: IgnoreOptions,
 }
@@ -330,6 +336,10 @@ impl Ignore {
                 }
             }
         };
+        let has_local_matchers = !custom_ig_matcher.is_empty()
+            || !ig_matcher.is_empty()
+            || !gi_matcher.is_empty()
+            || !gi_exclude_matcher.is_empty();
         let ig = IgnoreInner {
             compiled: self.0.compiled.clone(),
             dir: dir.to_path_buf(),
@@ -351,6 +361,7 @@ impl Ignore {
             git_exclude_matcher: gi_exclude_matcher,
             has_git,
             has_git_ancestor: has_git || self.0.has_git_ancestor,
+            has_local_matchers,
             opts: self.0.opts,
         };
         (ig, errs.into_error_option())
@@ -451,29 +462,34 @@ impl Ignore {
             !self.0.opts.require_git || self.0.has_git_ancestor;
         let mut saw_git = false;
         for ig in self.parents().take_while(|ig| !ig.0.is_absolute_parent) {
-            if m_custom_ignore.is_none() {
-                m_custom_ignore =
-                    ig.0.custom_ignore_matcher
-                        .matched(path, is_dir)
-                        .map(IgnoreMatch::gitignore);
-            }
-            if m_ignore.is_none() {
-                m_ignore =
-                    ig.0.ignore_matcher
-                        .matched(path, is_dir)
-                        .map(IgnoreMatch::gitignore);
-            }
-            if any_git && !saw_git && m_gi.is_none() {
-                m_gi =
-                    ig.0.git_ignore_matcher
-                        .matched(path, is_dir)
-                        .map(IgnoreMatch::gitignore);
-            }
-            if any_git && !saw_git && m_gi_exclude.is_none() {
-                m_gi_exclude =
-                    ig.0.git_exclude_matcher
-                        .matched(path, is_dir)
-                        .map(IgnoreMatch::gitignore);
+            // Skip matcher calls entirely when this level has no rules.
+            // We still need to advance `saw_git` for correct git boundary
+            // tracking.
+            if ig.0.has_local_matchers {
+                if m_custom_ignore.is_none() {
+                    m_custom_ignore =
+                        ig.0.custom_ignore_matcher
+                            .matched(path, is_dir)
+                            .map(IgnoreMatch::gitignore);
+                }
+                if m_ignore.is_none() {
+                    m_ignore =
+                        ig.0.ignore_matcher
+                            .matched(path, is_dir)
+                            .map(IgnoreMatch::gitignore);
+                }
+                if any_git && !saw_git && m_gi.is_none() {
+                    m_gi =
+                        ig.0.git_ignore_matcher
+                            .matched(path, is_dir)
+                            .map(IgnoreMatch::gitignore);
+                }
+                if any_git && !saw_git && m_gi_exclude.is_none() {
+                    m_gi_exclude =
+                        ig.0.git_exclude_matcher
+                            .matched(path, is_dir)
+                            .map(IgnoreMatch::gitignore);
+                }
             }
             saw_git = saw_git || ig.0.has_git;
             if !m_custom_ignore.is_none()
@@ -519,29 +535,31 @@ impl Ignore {
                 for ig in
                     self.parents().skip_while(|ig| !ig.0.is_absolute_parent)
                 {
-                    if m_custom_ignore.is_none() {
-                        m_custom_ignore =
-                            ig.0.custom_ignore_matcher
-                                .matched(&path, is_dir)
-                                .map(IgnoreMatch::gitignore);
-                    }
-                    if m_ignore.is_none() {
-                        m_ignore =
-                            ig.0.ignore_matcher
-                                .matched(&path, is_dir)
-                                .map(IgnoreMatch::gitignore);
-                    }
-                    if any_git && !saw_git && m_gi.is_none() {
-                        m_gi =
-                            ig.0.git_ignore_matcher
-                                .matched(&path, is_dir)
-                                .map(IgnoreMatch::gitignore);
-                    }
-                    if any_git && !saw_git && m_gi_exclude.is_none() {
-                        m_gi_exclude =
-                            ig.0.git_exclude_matcher
-                                .matched(&path, is_dir)
-                                .map(IgnoreMatch::gitignore);
+                    if ig.0.has_local_matchers {
+                        if m_custom_ignore.is_none() {
+                            m_custom_ignore =
+                                ig.0.custom_ignore_matcher
+                                    .matched(&path, is_dir)
+                                    .map(IgnoreMatch::gitignore);
+                        }
+                        if m_ignore.is_none() {
+                            m_ignore =
+                                ig.0.ignore_matcher
+                                    .matched(&path, is_dir)
+                                    .map(IgnoreMatch::gitignore);
+                        }
+                        if any_git && !saw_git && m_gi.is_none() {
+                            m_gi =
+                                ig.0.git_ignore_matcher
+                                    .matched(&path, is_dir)
+                                    .map(IgnoreMatch::gitignore);
+                        }
+                        if any_git && !saw_git && m_gi_exclude.is_none() {
+                            m_gi_exclude =
+                                ig.0.git_exclude_matcher
+                                    .matched(&path, is_dir)
+                                    .map(IgnoreMatch::gitignore);
+                        }
                     }
                     saw_git = saw_git || ig.0.has_git;
                     if !m_custom_ignore.is_none()
@@ -717,6 +735,8 @@ impl IgnoreBuilder {
             git_exclude_matcher: Gitignore::empty(),
             has_git: false,
             has_git_ancestor: false,
+            // Root builder has all empty local matchers.
+            has_local_matchers: false,
             opts: self.opts,
         }))
     }

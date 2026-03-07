@@ -146,6 +146,10 @@ struct IgnoreInner {
     git_exclude_matcher: Gitignore,
     /// Whether this directory contains a .git sub-directory.
     has_git: bool,
+    /// Whether this directory or any of its ancestors contains a .git
+    /// sub-directory. Cached at construction time to avoid walking the
+    /// parent chain on every call to `matched_ignore`.
+    has_git_ancestor: bool,
     /// Ignore config.
     opts: IgnoreOptions,
 }
@@ -228,6 +232,8 @@ impl Ignore {
                 } else {
                     false
                 };
+            igtmp.has_git_ancestor =
+                igtmp.has_git || ig.0.has_git_ancestor;
             let ig_arc = Arc::new(igtmp);
             ig = Ignore(ig_arc.clone());
             compiled.insert(
@@ -344,6 +350,7 @@ impl Ignore {
             git_ignore_matcher: gi_matcher,
             git_exclude_matcher: gi_exclude_matcher,
             has_git,
+            has_git_ancestor: has_git || self.0.has_git_ancestor,
             opts: self.0.opts,
         };
         (ig, errs.into_error_option())
@@ -441,7 +448,7 @@ impl Ignore {
             mut m_explicit,
         ) = (Match::None, Match::None, Match::None, Match::None, Match::None);
         let any_git =
-            !self.0.opts.require_git || self.parents().any(|ig| ig.0.has_git);
+            !self.0.opts.require_git || self.0.has_git_ancestor;
         let mut saw_git = false;
         for ig in self.parents().take_while(|ig| !ig.0.is_absolute_parent) {
             if m_custom_ignore.is_none() {
@@ -709,6 +716,7 @@ impl IgnoreBuilder {
             git_ignore_matcher: Gitignore::empty(),
             git_exclude_matcher: Gitignore::empty(),
             has_git: false,
+            has_git_ancestor: false,
             opts: self.opts,
         }))
     }

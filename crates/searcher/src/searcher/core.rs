@@ -40,6 +40,10 @@ pub(crate) struct Core<'s, M: 's, S> {
     /// Cached flag: true when any context (before or after) is configured.
     /// Avoids recomputing `max(before_context, after_context) > 0` per match.
     has_context: bool,
+    /// Cached line terminator byte extracted from the config's `LineTerminator`
+    /// enum once at construction. Avoids repeated enum dispatch in hot paths
+    /// such as line iteration, match locating, and line counting.
+    line_term: u8,
 }
 
 impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
@@ -69,6 +73,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             count: 0,
             has_max_matches: searcher.config.max_matches.is_some(),
             has_context: searcher.config.max_context() > 0,
+            line_term: searcher.config.line_term.as_byte(),
         };
         if !core.searcher.multi_line_with_matcher(&core.matcher) {
             if core.is_line_by_line_fast() {
@@ -205,7 +210,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             // large values of N) step when before_context==0.
             let context_start = lines::preceding(
                 buf,
-                self.config.line_term.as_byte(),
+                self.line_term,
                 self.config.before_context,
             );
             let consumed =
@@ -260,13 +265,13 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         let before_context_start = range.start()
             + lines::preceding(
                 &buf[range],
-                self.config.line_term.as_byte(),
+                self.line_term,
                 self.config.before_context - 1,
             );
 
         let range = Range::new(before_context_start, range.end());
         let mut stepper = LineStep::new(
-            self.config.line_term.as_byte(),
+            self.line_term,
             range.start(),
             range.end(),
         );
@@ -292,7 +297,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         let exceeded_match_limit = self.has_exceeded_match_limit();
         let range = Range::new(self.last_line_visited, upto);
         let mut stepper = LineStep::new(
-            self.config.line_term.as_byte(),
+            self.line_term,
             range.start(),
             range.end(),
         );
@@ -323,7 +328,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
     ) -> Result<bool, S::Error> {
         let range = Range::new(self.last_line_visited, upto);
         let mut stepper = LineStep::new(
-            self.config.line_term.as_byte(),
+            self.line_term,
             range.start(),
             range.end(),
         );
@@ -340,7 +345,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
 
         let range = Range::new(self.pos(), buf.len());
         let mut stepper = LineStep::new(
-            self.config.line_term.as_byte(),
+            self.line_term,
             range.start(),
             range.end(),
         );
@@ -467,7 +472,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             return Ok(false);
         }
         let mut stepper = LineStep::new(
-            self.config.line_term.as_byte(),
+            self.line_term,
             invert_match.start(),
             invert_match.end(),
         );
@@ -502,7 +507,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                 Ok(Some(LineMatchKind::Confirmed(i))) => {
                     let line = lines::locate(
                         buf,
-                        self.config.line_term.as_byte(),
+                        self.line_term,
                         Range::zero(i).offset(pos),
                     );
                     // If we matched beyond the end of the buffer, then we
@@ -516,7 +521,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                 Ok(Some(LineMatchKind::Candidate(i))) => {
                     let line = lines::locate(
                         buf,
-                        self.config.line_term.as_byte(),
+                        self.line_term,
                         Range::zero(i).offset(pos),
                     );
                     if self.is_match(&buf[line])? {
@@ -659,10 +664,8 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         start_of_line: usize,
     ) -> Result<bool, S::Error> {
         let is_gap = self.last_line_visited < start_of_line;
-        let any_context =
-            self.config.before_context > 0 || self.config.after_context > 0;
 
-        if !any_context || !self.has_sunk || !is_gap {
+        if !self.has_context || !self.has_sunk || !is_gap {
             Ok(true)
         } else {
             self.sink.context_break(&self.searcher)
@@ -675,7 +678,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                 return;
             }
             let slice = &buf[self.last_line_counted..upto];
-            let count = lines::count(slice, self.config.line_term.as_byte());
+            let count = lines::count(slice, self.line_term);
             *line_number += count;
             self.last_line_counted = upto;
         }
@@ -711,7 +714,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             // whether the regex can match `\r` or not. Namely, a `\r` is
             // neither necessary nor sufficient to terminate a line. A `\n` is
             // always required.
-            if non_matching.contains(self.config.line_term.as_byte()) {
+            if non_matching.contains(self.line_term) {
                 return true;
             }
         }

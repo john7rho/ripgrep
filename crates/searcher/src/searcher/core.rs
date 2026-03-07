@@ -34,6 +34,7 @@ pub(crate) struct Core<'s, M: 's, S> {
     has_sunk: bool,
     has_matched: bool,
     count: u64,
+    match_ranges: Vec<std::ops::Range<usize>>,
 }
 
 impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
@@ -61,6 +62,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             has_sunk: false,
             has_matched: false,
             count: 0,
+            match_ranges: Vec::new(),
         };
         if !core.searcher.multi_line_with_matcher(&core.matcher) {
             if core.is_line_by_line_fast() {
@@ -94,6 +96,14 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
 
     pub(crate) fn matcher(&self) -> &M {
         &self.matcher
+    }
+
+    pub(crate) fn set_match_ranges(
+        &mut self,
+        ranges: &[std::ops::Range<usize>],
+    ) {
+        self.match_ranges.clear();
+        self.match_ranges.extend_from_slice(ranges);
     }
 
     pub(crate) fn matched(
@@ -533,6 +543,14 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         self.count_lines(buf, range.start());
         let offset = self.absolute_byte_offset + range.start() as u64;
         let linebuf = &buf[*range];
+        // Adjust match_ranges to be relative to `linebuf` (i.e., relative
+        // to range.start() in buf). Also clamp to the line boundaries.
+        let range_start = range.start();
+        let range_end = range.end();
+        for r in self.match_ranges.iter_mut() {
+            r.start = r.start.saturating_sub(range_start);
+            r.end = r.end.saturating_sub(range_start).min(range_end - range_start);
+        }
         let keepgoing = self.sink.matched(
             &self.searcher,
             &SinkMatch {
@@ -542,6 +560,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                 line_number: self.line_number,
                 buffer: buf,
                 bytes_range_in_buffer: range.start()..range.end(),
+                match_ranges: &self.match_ranges,
             },
         )?;
         if !keepgoing {

@@ -170,18 +170,8 @@ impl HiArgs {
         } else if let Some(threads) = low.threads {
             threads
         } else {
-            {
-                // On Apple Silicon, the default cap of 12 over-subscribes for
-                // I/O-bound directory searches. Benchmarks show 4 threads is
-                // optimal (24% faster than 10) because extra threads triple
-                // sys time on APFS without improving throughput. Cap at 6 to
-                // provide headroom for larger machines.
-                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                let cap = 6usize;
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                let cap = 12usize;
-                std::thread::available_parallelism().map_or(1, |n| n.get()).min(cap)
-            }
+            let cap = default_thread_cap();
+            std::thread::available_parallelism().map_or(1, |n| n.get()).min(cap)
         };
         log::debug!("using {threads} thread(s)");
         let with_filename = low
@@ -1477,6 +1467,67 @@ When multiline mode is enabled, new line characters can be matched.",
 }
 
 /// Possibly suggest the `-a/--text` flag.
+/// Returns the default thread cap for the current platform.
+///
+/// On Apple Silicon, this queries `hw.perflevel0.logicalcpu` via sysctl to
+/// determine the number of performance (P) cores. Apple Silicon chips have
+/// asymmetric P/E cores, and I/O-bound directory searches scale poorly past
+/// the P-core count — extra E-core threads add kernel contention without
+/// improving throughput.
+///
+/// Examples of P-core counts across Apple Silicon variants:
+///   M1/M2/M3/M4:       4 P-cores  → cap 4
+///   M3 Pro:             6 P-cores  → cap 6
+///   M1 Pro/Max, M2 Pro: 8 P-cores → cap 8
+///   M4 Pro:            10 P-cores  → cap 10
+///   M3 Max:            12 P-cores  → cap 12
+///   M2/M4 Ultra:      16+ P-cores → cap 12 (global max)
+///
+/// Falls back to 6 if the sysctl query fails. Other platforms use 12.
+fn default_thread_cap() -> usize {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        apple_silicon_pcore_count().unwrap_or(6).max(4).min(12)
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        12
+    }
+}
+
+/// Returns the number of performance-level (P) cores on Apple Silicon
+/// by querying `sysctl hw.perflevel0.logicalcpu`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn apple_silicon_pcore_count() -> Option<usize> {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            oldp: *mut std::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *const std::ffi::c_void,
+            newlen: usize,
+        ) -> std::ffi::c_int;
+    }
+    let mut value: i32 = 0;
+    let mut size = std::mem::size_of::<i32>();
+    // SAFETY: sysctlbyname is a standard macOS API. We pass correctly sized
+    // buffers and check the return value before using the result.
+    let ret = unsafe {
+        sysctlbyname(
+            b"hw.perflevel0.logicalcpu\0".as_ptr() as *const std::ffi::c_char,
+            &mut value as *mut i32 as *mut std::ffi::c_void,
+            &mut size,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if ret == 0 && value > 0 {
+        Some(value as usize)
+    } else {
+        None
+    }
+}
+
 fn suggest_text(msg: String) -> String {
     if msg.contains("pattern contains \"\\0\"") {
         format!(

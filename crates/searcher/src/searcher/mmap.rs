@@ -70,11 +70,11 @@ impl MmapChoice {
         if !self.is_enabled() {
             return None;
         }
-        // macOS mmap was unconditionally disabled based on older benchmarks.
-        // Re-enabled for Apple Silicon evaluation.
-        // if cfg!(target_os = "macos") {
-        //     return None;
-        // }
+        // On Intel Macs, mmap has historically shown no benefit. On Apple
+        // Silicon, unified memory makes mmap advantageous for large files.
+        if cfg!(all(target_os = "macos", not(target_arch = "aarch64"))) {
+            return None;
+        }
         // SAFETY: This is acceptable because the only way `MmapChoiceImpl` can
         // be `Auto` is if the caller invoked the `auto` constructor, which
         // is itself not safe. Thus, this is a propagation of the caller's

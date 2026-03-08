@@ -128,13 +128,17 @@ def taskpolicy_available() -> bool:
 
 
 def wrap_with_taskpolicy(cmd: List[str]) -> List[str]:
-    """Prepend taskpolicy to bias scheduling toward P-cores.
+    """Return the command unchanged (taskpolicy wrapping disabled).
 
-    Uses 'taskpolicy -c user-interactive' to set the highest QoS class,
-    which the macOS scheduler preferentially places on performance cores.
-    Only call this after verifying taskpolicy_available().
+    Previously this attempted 'taskpolicy -c user-interactive', but the
+    -c (clamp) flag only accepts 'utility', 'background', or 'maintenance'
+    — it can only lower QoS, not raise it.  Processes already run at default
+    QoS which preferentially schedules on P-cores, so no wrapping is needed.
+
+    The function is retained (rather than deleted) so that call sites do not
+    need modification; it simply acts as an identity function.
     """
-    return ['taskpolicy', '-c', 'user-interactive'] + cmd
+    return cmd
 
 
 def check_background_interference() -> List[str]:
@@ -1077,7 +1081,7 @@ class BenchmarkRunner:
         thermal: ThermalMonitor,
         cache_mode: str = 'warm',
         use_sudo: bool = False,
-        use_taskpolicy: bool = True,
+        use_taskpolicy: bool = False,
         convergence_threshold: float = 0.05,
     ) -> None:
         self.rg_bin = rg_bin
@@ -2135,7 +2139,7 @@ Examples:
 
     # Detect system info
     system_info = detect_system_info()
-    system_info['use_taskpolicy'] = not args.no_taskpolicy and taskpolicy_available()
+    system_info['use_taskpolicy'] = False
     eprint('System: %s (%s)' % (
         system_info.get('chip', 'unknown'),
         system_info.get('arch', 'unknown'),
@@ -2268,7 +2272,7 @@ Examples:
         thermal=thermal,
         cache_mode=args.cache,
         use_sudo=args.sudo,
-        use_taskpolicy=not args.no_taskpolicy,
+        use_taskpolicy=False,
         convergence_threshold=args.convergence_threshold,
     )
 

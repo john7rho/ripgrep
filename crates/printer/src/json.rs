@@ -777,7 +777,12 @@ impl<'p, 's, M: Matcher, W: io::Write> Sink for JSONSink<'p, 's, M, W> {
         self.json.matches.clear();
 
         let submatches = if searcher.invert_match() {
-            self.record_matches(searcher, ctx.bytes(), 0..ctx.bytes().len(), &[])?;
+            self.record_matches(
+                searcher,
+                ctx.bytes(),
+                0..ctx.bytes().len(),
+                &[],
+            )?;
             self.replace(searcher, ctx.bytes(), 0..ctx.bytes().len())?;
             SubMatches::new(
                 ctx.bytes(),

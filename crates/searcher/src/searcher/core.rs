@@ -566,7 +566,8 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             for r in self.match_ranges.iter() {
                 self.adjusted_match_ranges.push(
                     r.start.saturating_sub(range_start)
-                        ..r.end.saturating_sub(range_start)
+                        ..r.end
+                            .saturating_sub(range_start)
                             .min(range_end - range_start),
                 );
             }

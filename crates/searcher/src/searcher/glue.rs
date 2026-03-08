@@ -240,8 +240,7 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
             None => {
                 if self.core.needs_match_granularity() {
                     self.pending_match_ranges.clear();
-                    self.pending_match_ranges
-                        .push(mat.start()..mat.end());
+                    self.pending_match_ranges.push(mat.start()..mat.end());
                 }
                 self.last_match = Some(line);
                 Ok(true)
@@ -262,8 +261,7 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
                 // And also the associated commit fixing #1311.
                 if last_match.end() >= line.start() {
                     if self.core.needs_match_granularity() {
-                        self.pending_match_ranges
-                            .push(mat.start()..mat.end());
+                        self.pending_match_ranges.push(mat.start()..mat.end());
                     }
                     self.last_match = Some(last_match.with_end(line.end()));
                     Ok(true)
@@ -280,8 +278,7 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
                         Vec::new()
                     };
                     if self.core.needs_match_granularity() {
-                        self.pending_match_ranges
-                            .push(mat.start()..mat.end());
+                        self.pending_match_ranges.push(mat.start()..mat.end());
                     }
                     self.last_match = Some(line);
                     if !self.sink_context(&last_match)? {

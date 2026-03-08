@@ -171,13 +171,13 @@ impl HiArgs {
             threads
         } else {
             {
-                // On Apple Silicon, the default cap of 12 over-subscribes for
-                // I/O-bound directory searches. Benchmarks show 4 threads is
-                // optimal (24% faster than 10) because extra threads triple
-                // sys time on APFS without improving throughput. Cap at 6 to
-                // provide headroom for larger machines.
+                // On Apple Silicon (M4: 4P+6E), benchmarks show 4 threads is
+                // optimal for I/O-bound directory searches — going beyond 4
+                // spills work onto efficiency cores, which nearly doubles
+                // wall-clock time (j4=0.51s vs j6=0.99s). Cap at 4 to stay
+                // on performance cores.
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                let cap = 6usize;
+                let cap = 4usize;
                 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
                 let cap = 12usize;
                 std::thread::available_parallelism().map_or(1, |n| n.get()).min(cap)

@@ -4,6 +4,7 @@ Provides the definition of high level arguments from CLI flags.
 
 use std::{
     collections::HashSet,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -28,11 +29,7 @@ fn apple_silicon_pcore_count() -> Option<usize> {
             std::ptr::null_mut(),
             0,
         );
-        if ret == 0 && value > 0 {
-            Some(value as usize)
-        } else {
-            None
-        }
+        if ret == 0 && value > 0 { Some(value as usize) } else { None }
     }
 }
 
@@ -146,6 +143,21 @@ pub(crate) struct HiArgs {
     with_filename: bool,
 }
 
+const MMAP_AUTO_MAX_FILES: usize = 8;
+const MMAP_AUTO_SMALL_FILE_BYTES: u64 = 64 * 1024;
+const MMAP_AUTO_MIN_FILE_BYTES: u64 = 1 << 20;
+const MMAP_AUTO_MIN_TOTAL_BYTES: u64 = 4 << 20;
+const MMAP_AUTO_MULTILINE_MIN_FILE_BYTES: u64 = 256 << 10;
+const MMAP_AUTO_MULTILINE_MIN_TOTAL_BYTES: u64 = 1 << 20;
+
+#[derive(Debug, Default)]
+struct AutoMmapStats {
+    file_count: usize,
+    total_bytes: u64,
+    max_file_bytes: u64,
+    small_file_count: usize,
+}
+
 impl HiArgs {
     /// Convert low level arguments into high level arguments.
     ///
@@ -220,9 +232,14 @@ impl HiArgs {
                 // 4 (the minimum P-core count across all Apple Silicon).
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 let cap = apple_silicon_pcore_count().unwrap_or(4);
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                #[cfg(not(all(
+                    target_os = "macos",
+                    target_arch = "aarch64"
+                )))]
                 let cap = 12usize;
-                std::thread::available_parallelism().map_or(1, |n| n.get()).min(cap)
+                std::thread::available_parallelism()
+                    .map_or(1, |n| n.get())
+                    .min(cap)
             }
         };
         log::debug!("using {threads} thread(s)");
@@ -285,17 +302,12 @@ impl HiArgs {
             let maybe = unsafe { grep::searcher::MmapChoice::auto() };
             let never = grep::searcher::MmapChoice::never();
             match low.mmap {
-                MmapMode::Auto => {
-                    if paths.paths.len() <= 10
-                        && paths.paths.iter().all(|p| p.is_file())
-                    {
-                        // If we're only searching a few paths and all of them
-                        // are files, then memory maps are probably faster.
-                        maybe
-                    } else {
-                        never
-                    }
+                MmapMode::Auto
+                    if should_use_auto_mmap(low.multiline, &paths) =>
+                {
+                    maybe
                 }
+                MmapMode::Auto => never,
                 MmapMode::AlwaysTryMmap => maybe,
                 MmapMode::Never => never,
             }
@@ -971,6 +983,93 @@ impl HiArgs {
     }
 }
 
+fn should_use_auto_mmap(multiline: bool, paths: &Paths) -> bool {
+    let Some(stats) = AutoMmapStats::from_paths(paths) else {
+        return false;
+    };
+    let enabled = stats.should_enable(multiline);
+    log::debug!(
+        "auto-mmap {} for {} explicit file(s): total_bytes={}, \
+         max_file_bytes={}, multiline={}",
+        if enabled { "enabled" } else { "disabled" },
+        stats.file_count,
+        stats.total_bytes,
+        stats.max_file_bytes,
+        multiline,
+    );
+    enabled
+}
+
+impl AutoMmapStats {
+    fn from_paths(paths: &Paths) -> Option<AutoMmapStats> {
+        if paths.has_implicit_path {
+            log::debug!("auto-mmap disabled: path selection was implicit");
+            return None;
+        }
+        if paths.is_only_stdin() {
+            log::debug!("auto-mmap disabled: searching stdin");
+            return None;
+        }
+
+        let mut stats = AutoMmapStats::default();
+        for path in &paths.paths {
+            if path == Path::new("-") {
+                log::debug!("auto-mmap disabled: stdin is in the path list");
+                return None;
+            }
+            let metadata = match fs::metadata(path) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    log::debug!(
+                        "{}: auto-mmap disabled: failed to read metadata: {}",
+                        path.display(),
+                        err,
+                    );
+                    return None;
+                }
+            };
+            if !metadata.is_file() {
+                log::debug!(
+                    "{}: auto-mmap disabled: path is not a file",
+                    path.display(),
+                );
+                return None;
+            }
+            stats.record(&metadata);
+        }
+        if stats.file_count == 0 { None } else { Some(stats) }
+    }
+
+    fn record(&mut self, metadata: &fs::Metadata) {
+        let len = metadata.len();
+        self.file_count += 1;
+        self.total_bytes = self.total_bytes.saturating_add(len);
+        self.max_file_bytes = self.max_file_bytes.max(len);
+        if len <= MMAP_AUTO_SMALL_FILE_BYTES {
+            self.small_file_count += 1;
+        }
+    }
+
+    fn should_enable(&self, multiline: bool) -> bool {
+        if self.file_count == 0 || self.file_count > MMAP_AUTO_MAX_FILES {
+            return false;
+        }
+        if self.file_count > 2 && self.small_file_count == self.file_count {
+            return false;
+        }
+        let (min_file_bytes, min_total_bytes) = if multiline {
+            (
+                MMAP_AUTO_MULTILINE_MIN_FILE_BYTES,
+                MMAP_AUTO_MULTILINE_MIN_TOTAL_BYTES,
+            )
+        } else {
+            (MMAP_AUTO_MIN_FILE_BYTES, MMAP_AUTO_MIN_TOTAL_BYTES)
+        };
+        self.max_file_bytes >= min_file_bytes
+            || self.total_bytes >= min_total_bytes
+    }
+}
+
 /// State that only needs to be computed once during argument parsing.
 ///
 /// This state is meant to be somewhat generic and shared across multiple
@@ -1529,5 +1628,105 @@ binary detection is enabled and matching a NUL byte is impossible.",
         )
     } else {
         msg
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::*;
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "rg-hiargs-{name}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            TempDir { path }
+        }
+
+        fn create_file(&self, name: &str, len: usize) -> PathBuf {
+            let path = self.path.join(name);
+            fs::write(&path, vec![b'x'; len]).unwrap();
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn low_args(multiline: bool) -> LowArgs {
+        let mut low = LowArgs::default();
+        low.multiline = multiline;
+        low
+    }
+
+    #[test]
+    fn auto_mmap_prefers_few_large_multiline_files() {
+        let dir = TempDir::new("multiline-large");
+        let path = dir.create_file(
+            "hay",
+            (MMAP_AUTO_MULTILINE_MIN_FILE_BYTES + 4096) as usize,
+        );
+        let paths = Paths {
+            paths: vec![path],
+            has_implicit_path: false,
+            is_one_file: true,
+        };
+
+        assert!(should_use_auto_mmap(low_args(true).multiline, &paths));
+        assert!(!should_use_auto_mmap(low_args(false).multiline, &paths));
+    }
+
+    #[test]
+    fn auto_mmap_rejects_many_tiny_files() {
+        let dir = TempDir::new("tiny-files");
+        let mut paths = Vec::new();
+        for i in 0..4 {
+            paths.push(dir.create_file(&format!("tiny-{i}"), 4096));
+        }
+        let paths =
+            Paths { paths, has_implicit_path: false, is_one_file: false };
+
+        assert!(!should_use_auto_mmap(low_args(false).multiline, &paths));
+        assert!(!should_use_auto_mmap(low_args(true).multiline, &paths));
+    }
+
+    #[test]
+    fn auto_mmap_requires_explicit_file_paths() {
+        let dir = TempDir::new("implicit-path");
+        let path =
+            dir.create_file("hay", (MMAP_AUTO_MIN_FILE_BYTES + 4096) as usize);
+        let paths = Paths {
+            paths: vec![path],
+            has_implicit_path: true,
+            is_one_file: true,
+        };
+
+        assert!(!should_use_auto_mmap(low_args(false).multiline, &paths));
+        assert!(!should_use_auto_mmap(
+            low_args(true).multiline,
+            &Paths {
+                paths: vec![PathBuf::from("-")],
+                has_implicit_path: false,
+                is_one_file: true,
+            },
+        ));
     }
 }

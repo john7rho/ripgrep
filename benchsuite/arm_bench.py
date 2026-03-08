@@ -1394,6 +1394,45 @@ def scenario_thread_scaling(
     )
 
 
+def scenario_thread_scaling_output(
+    rg_bin: str, suite_dir: str
+) -> BenchmarkGroup:
+    """Thread scaling benchmark for output-heavy search modes.
+
+    These modes spend more time in sinks and synchronization than simple
+    count-style searches, so they are useful when evaluating workload-aware
+    thread policies on Apple Silicon.
+    """
+    require_corpus(suite_dir, 'linux')
+    cwd = linux_dir(suite_dir)
+    thread_counts = [1, 2, 4, 6, 8]
+
+    configs = []
+    for j in thread_counts:
+        configs.append(BenchmarkConfig(
+            name='rg --json -j%d' % j,
+            cmd=[rg_bin, '--json', '-j', str(j), 'return'],
+            cwd=cwd,
+            samples=THREAD_SCALING_SAMPLES,
+            warmups=DEFAULT_WARMUPS,
+        ))
+        configs.append(BenchmarkConfig(
+            name='rg -n -o -j%d' % j,
+            cmd=[rg_bin, '-n', '-o', '-j', str(j), 'return'],
+            cwd=cwd,
+            samples=THREAD_SCALING_SAMPLES,
+            warmups=DEFAULT_WARMUPS,
+        ))
+
+    return BenchmarkGroup(
+        name='thread_scaling_output',
+        description='Thread scaling for output-heavy modes (--json and -o) on Linux kernel',
+        configs=configs,
+        interleaved=True,
+        cv_threshold=CV_THRESHOLD_MULTI_FILE,
+    )
+
+
 def scenario_mmap_vs_read(
     rg_bin: str, suite_dir: str
 ) -> BenchmarkGroup:
@@ -1622,6 +1661,7 @@ def scenario_directory_io(
 
 ALL_SCENARIOS = {
     'thread_scaling': scenario_thread_scaling,
+    'thread_scaling_output': scenario_thread_scaling_output,
     'mmap_vs_read': scenario_mmap_vs_read,
     'mmap_multiline': scenario_mmap_multiline,
     'multiline_vs_singleline': scenario_multiline_vs_singleline,

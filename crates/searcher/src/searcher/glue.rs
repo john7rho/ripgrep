@@ -185,9 +185,11 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
                             // after_context_by_line) does not consume
                             // the ranges meant for the real match.
                             if self.sink_context(&last_match)? {
-                                self.core.set_match_ranges(
-                                    &self.pending_match_ranges,
-                                );
+                                if self.core.needs_match_granularity() {
+                                    self.core.set_match_ranges(
+                                        &self.pending_match_ranges,
+                                    );
+                                }
                                 self.sink_matched(&last_match)?;
                             }
                             true
@@ -236,9 +238,11 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
         // that a single line is never sinked more than once.
         match self.last_match.take() {
             None => {
-                self.pending_match_ranges.clear();
-                self.pending_match_ranges
-                    .push(mat.start()..mat.end());
+                if self.core.needs_match_granularity() {
+                    self.pending_match_ranges.clear();
+                    self.pending_match_ranges
+                        .push(mat.start()..mat.end());
+                }
                 self.last_match = Some(line);
                 Ok(true)
             }
@@ -257,8 +261,10 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
                 // See: https://github.com/BurntSushi/ripgrep/issues/1311
                 // And also the associated commit fixing #1311.
                 if last_match.end() >= line.start() {
-                    self.pending_match_ranges
-                        .push(mat.start()..mat.end());
+                    if self.core.needs_match_granularity() {
+                        self.pending_match_ranges
+                            .push(mat.start()..mat.end());
+                    }
                     self.last_match = Some(last_match.with_end(line.end()));
                     Ok(true)
                 } else {
@@ -268,15 +274,22 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
                     // (e.g., from after_context_by_line when the match limit
                     // is exceeded), which would consume and clear the ranges
                     // meant for the actual match below.
-                    let pending =
-                        std::mem::take(&mut self.pending_match_ranges);
-                    self.pending_match_ranges
-                        .push(mat.start()..mat.end());
+                    let pending = if self.core.needs_match_granularity() {
+                        std::mem::take(&mut self.pending_match_ranges)
+                    } else {
+                        Vec::new()
+                    };
+                    if self.core.needs_match_granularity() {
+                        self.pending_match_ranges
+                            .push(mat.start()..mat.end());
+                    }
                     self.last_match = Some(line);
                     if !self.sink_context(&last_match)? {
                         return Ok(false);
                     }
-                    self.core.set_match_ranges(&pending);
+                    if self.core.needs_match_granularity() {
+                        self.core.set_match_ranges(&pending);
+                    }
                     self.sink_matched(&last_match)
                 }
             }

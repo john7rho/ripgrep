@@ -34,6 +34,7 @@ pub(crate) struct Core<'s, M: 's, S> {
     has_sunk: bool,
     has_matched: bool,
     count: u64,
+    needs_match_granularity: bool,
     match_ranges: Vec<std::ops::Range<usize>>,
     adjusted_match_ranges: Vec<std::ops::Range<usize>>,
 }
@@ -47,6 +48,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
     ) -> Core<'s, M, S> {
         let line_number =
             if searcher.config.line_number { Some(1) } else { None };
+        let needs_match_granularity = sink.requires_match_granularity();
         let core = Core {
             config: &searcher.config,
             matcher,
@@ -63,6 +65,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             has_sunk: false,
             has_matched: false,
             count: 0,
+            needs_match_granularity,
             match_ranges: Vec::new(),
             adjusted_match_ranges: Vec::new(),
         };
@@ -100,10 +103,17 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         &self.matcher
     }
 
+    pub(crate) fn needs_match_granularity(&self) -> bool {
+        self.needs_match_granularity
+    }
+
     pub(crate) fn set_match_ranges(
         &mut self,
         ranges: &[std::ops::Range<usize>],
     ) {
+        if !self.needs_match_granularity {
+            return;
+        }
         self.match_ranges.clear();
         self.match_ranges.extend_from_slice(ranges);
     }
@@ -545,19 +555,25 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         self.count_lines(buf, range.start());
         let offset = self.absolute_byte_offset + range.start() as u64;
         let linebuf = &buf[*range];
-        // Adjust match_ranges to be relative to `linebuf` (i.e., relative
-        // to range.start() in buf). Also clamp to the line boundaries.
-        // We use a separate Vec so the originals are not corrupted if
-        // sink_matched is called again (e.g., from after_context_by_line).
-        let range_start = range.start();
-        let range_end = range.end();
-        self.adjusted_match_ranges.clear();
-        for r in self.match_ranges.iter() {
-            self.adjusted_match_ranges.push(
-                r.start.saturating_sub(range_start)
-                    ..r.end.saturating_sub(range_start).min(range_end - range_start),
-            );
-        }
+        let match_ranges = if self.needs_match_granularity {
+            // Adjust match_ranges to be relative to `linebuf` (i.e., relative
+            // to range.start() in buf). Also clamp to the line boundaries.
+            // We use a separate Vec so the originals are not corrupted if
+            // sink_matched is called again (e.g., from after_context_by_line).
+            let range_start = range.start();
+            let range_end = range.end();
+            self.adjusted_match_ranges.clear();
+            for r in self.match_ranges.iter() {
+                self.adjusted_match_ranges.push(
+                    r.start.saturating_sub(range_start)
+                        ..r.end.saturating_sub(range_start)
+                            .min(range_end - range_start),
+                );
+            }
+            self.adjusted_match_ranges.as_slice()
+        } else {
+            &[]
+        };
         let keepgoing = self.sink.matched(
             &self.searcher,
             &SinkMatch {
@@ -567,14 +583,16 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                 line_number: self.line_number,
                 buffer: buf,
                 bytes_range_in_buffer: range.start()..range.end(),
-                match_ranges: &self.adjusted_match_ranges,
+                match_ranges,
             },
         )?;
-        // Clear match_ranges after use so that stale ranges are never
-        // accidentally reused by a subsequent sink_matched call that
-        // was not preceded by set_match_ranges (e.g., from
-        // after_context_by_line).
-        self.match_ranges.clear();
+        if self.needs_match_granularity {
+            // Clear match_ranges after use so that stale ranges are never
+            // accidentally reused by a subsequent sink_matched call that
+            // was not preceded by set_match_ranges (e.g., from
+            // after_context_by_line).
+            self.match_ranges.clear();
+        }
         if !keepgoing {
             return Ok(false);
         }

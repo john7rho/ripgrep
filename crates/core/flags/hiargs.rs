@@ -7,6 +7,47 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Returns the number of performance (P) cores on Apple Silicon Macs.
+///
+/// Uses the `hw.perflevel0.logicalcpu` sysctl, which reports the count of
+/// high-performance cores. Falls back to `None` if the sysctl is unavailable
+/// (e.g., on Intel Macs or non-macOS platforms).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn apple_silicon_pcore_count() -> Option<usize> {
+    // SAFETY: sysctlbyname is a stable macOS API for querying system
+    // parameters. We pass a valid null-terminated string, a properly sized
+    // output buffer, and null for the "set" parameters (read-only query).
+    unsafe {
+        let name = b"hw.perflevel0.logicalcpu\0";
+        let mut value: i32 = 0;
+        let mut size: usize = std::mem::size_of::<i32>();
+        let ret = libc_sysctlbyname(
+            name.as_ptr() as *const std::ffi::c_char,
+            &mut value as *mut i32 as *mut std::ffi::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        );
+        if ret == 0 && value > 0 {
+            Some(value as usize)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe extern "C" {
+    #[link_name = "sysctlbyname"]
+    fn libc_sysctlbyname(
+        name: *const std::ffi::c_char,
+        oldp: *mut std::ffi::c_void,
+        oldlenp: *mut usize,
+        newp: *mut std::ffi::c_void,
+        newlen: usize,
+    ) -> std::ffi::c_int;
+}
+
 use {
     bstr::BString,
     grep::printer::{ColorSpecs, SummaryKind},
@@ -171,13 +212,14 @@ impl HiArgs {
             threads
         } else {
             {
-                // On Apple Silicon (M4: 4P+6E), benchmarks show 4 threads is
-                // optimal for I/O-bound directory searches — going beyond 4
-                // spills work onto efficiency cores, which nearly doubles
-                // wall-clock time (j4=0.51s vs j6=0.99s). Cap at 4 to stay
-                // on performance cores.
+                // On Apple Silicon, benchmarks show that threads should not
+                // exceed the P-core count — going beyond spills work onto
+                // efficiency cores, which degrades wall-clock time. Detect
+                // the P-core count dynamically to adapt to M4 (4P), M4 Pro
+                // (10P), M4 Max (12P), M3 Ultra (16P), etc. Falls back to
+                // 4 (the minimum P-core count across all Apple Silicon).
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-                let cap = 4usize;
+                let cap = apple_silicon_pcore_count().unwrap_or(4);
                 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
                 let cap = 12usize;
                 std::thread::available_parallelism().map_or(1, |n| n.get()).min(cap)

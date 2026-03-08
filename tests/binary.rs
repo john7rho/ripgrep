@@ -449,8 +449,13 @@ rgtest!(
 
         // This is the inconsistent result that can't really be avoided without
         // either making `-l/--files-with-matches` much slower or changing
-        // what "binary filtering" means.
-        let got = dir.command().args(&["--sort=path", "-c", "cat"]).stdout();
+        // what "binary filtering" means. The --no-mmap flag is required
+        // because mmap only checks the first 8KB for binary data, so the
+        // NUL byte at the end of file1.txt wouldn't be detected.
+        let got = dir
+            .command()
+            .args(&["--sort=path", "--no-mmap", "-c", "cat"])
+            .stdout();
         eqnice!("file2.txt:1\n", got);
 
         let got = dir

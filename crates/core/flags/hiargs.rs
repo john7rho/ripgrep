@@ -286,7 +286,17 @@ impl HiArgs {
             let never = grep::searcher::MmapChoice::never();
             match low.mmap {
                 MmapMode::Auto => {
-                    if paths.paths.len() <= 10
+                    if cfg!(all(
+                        target_os = "macos",
+                        target_arch = "aarch64"
+                    )) {
+                        // On Apple Silicon, unified memory makes mmap
+                        // consistently faster than buffered reads for
+                        // file search, even across many files. The
+                        // lazy page-fault model allows better I/O and
+                        // compute overlap with parallel worker threads.
+                        maybe
+                    } else if paths.paths.len() <= 10
                         && paths.paths.iter().all(|p| p.is_file())
                     {
                         // If we're only searching a few paths and all of them

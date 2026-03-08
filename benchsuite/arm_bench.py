@@ -1134,10 +1134,6 @@ class BenchmarkRunner:
 
         Convergence checking is skipped in cold cache mode (convergence
         is meaningless when the cache is purged each time).
-
-        The first warmup iteration counts output lines (to record line
-        counts without affecting timed samples). Subsequent warmups
-        send stdout to /dev/null.
         """
         eprint('  Warmups: %d per config (+ up to %d for convergence)...'
                % (warmup_count, max_extra_warmups))
@@ -1148,18 +1144,13 @@ class BenchmarkRunner:
         }
 
         for w in range(warmup_count):
-            # Count lines only on the first warmup to capture line counts
-            # without adding pipe overhead to timed samples
-            count = (w == 0)
             for cfg in group.configs:
                 if self.cache_mode == 'cold':
                     purge_cache(self.use_sudo)
                 cmd = cfg.cmd
                 if self.use_taskpolicy:
                     cmd = wrap_with_taskpolicy(cmd)
-                timing = run_timed(cmd, cwd=cfg.cwd, count_lines=count)
-                if count and timing.line_count is not None:
-                    result.results[cfg.name].line_counts.append(timing.line_count)
+                timing = run_timed(cmd, cwd=cfg.cwd, count_lines=False)
                 # Track last 3 times
                 last_times[cfg.name].append(timing.wall_time)
                 if len(last_times[cfg.name]) > 3:
@@ -1251,7 +1242,17 @@ class BenchmarkRunner:
         sample_count = max(cfg.samples for cfg in group.configs)
         warmup_count = max(cfg.warmups for cfg in group.configs)
 
-        # Warmups with convergence detection (also captures line counts)
+        # Correctness pass: capture expected line counts using the raw
+        # command (no taskpolicy, no timing).  This is a pure correctness
+        # check — it must not go through the performance path because
+        # taskpolicy swallows child stdout on macOS.
+        eprint('  Capturing expected line counts...')
+        for cfg in group.configs:
+            verification = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=True)
+            if verification.line_count is not None:
+                result.results[cfg.name].line_counts.append(verification.line_count)
+
+        # Warmups with convergence detection
         self._run_warmups(group, result, warmup_count,
                           convergence_threshold=self.convergence_threshold)
 

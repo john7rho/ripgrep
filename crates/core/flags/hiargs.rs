@@ -28,11 +28,7 @@ fn apple_silicon_pcore_count() -> Option<usize> {
             std::ptr::null_mut(),
             0,
         );
-        if ret == 0 && value > 0 {
-            Some(value as usize)
-        } else {
-            None
-        }
+        if ret == 0 && value > 0 { Some(value as usize) } else { None }
     }
 }
 
@@ -220,9 +216,14 @@ impl HiArgs {
                 // 4 (the minimum P-core count across all Apple Silicon).
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 let cap = apple_silicon_pcore_count().unwrap_or(4);
-                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                #[cfg(not(all(
+                    target_os = "macos",
+                    target_arch = "aarch64"
+                )))]
                 let cap = 12usize;
-                std::thread::available_parallelism().map_or(1, |n| n.get()).min(cap)
+                std::thread::available_parallelism()
+                    .map_or(1, |n| n.get())
+                    .min(cap)
             }
         };
         log::debug!("using {threads} thread(s)");

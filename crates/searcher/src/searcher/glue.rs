@@ -144,6 +144,7 @@ pub(crate) struct MultiLine<'s, M, S> {
     core: Core<'s, M, S>,
     slice: &'s [u8],
     last_match: Option<Range>,
+    pending_match_ranges: Vec<std::ops::Range<usize>>,
 }
 
 impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
@@ -160,6 +161,7 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
             core: Core::new(searcher, matcher, write_to, true),
             slice,
             last_match: None,
+            pending_match_ranges: Vec::new(),
         }
     }
 
@@ -177,7 +179,15 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
                     keepgoing = match self.last_match.take() {
                         None => true,
                         Some(last_match) => {
+                            // Call sink_context before set_match_ranges
+                            // so that any sink_matched triggered inside
+                            // sink_context (e.g., from
+                            // after_context_by_line) does not consume
+                            // the ranges meant for the real match.
                             if self.sink_context(&last_match)? {
+                                self.core.set_match_ranges(
+                                    &self.pending_match_ranges,
+                                );
                                 self.sink_matched(&last_match)?;
                             }
                             true
@@ -226,6 +236,9 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
         // that a single line is never sinked more than once.
         match self.last_match.take() {
             None => {
+                self.pending_match_ranges.clear();
+                self.pending_match_ranges
+                    .push(mat.start()..mat.end());
                 self.last_match = Some(line);
                 Ok(true)
             }
@@ -244,13 +257,26 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
                 // See: https://github.com/BurntSushi/ripgrep/issues/1311
                 // And also the associated commit fixing #1311.
                 if last_match.end() >= line.start() {
+                    self.pending_match_ranges
+                        .push(mat.start()..mat.end());
                     self.last_match = Some(last_match.with_end(line.end()));
                     Ok(true)
                 } else {
+                    // Flush the previous group of matches.
+                    // We must call sink_context *before* set_match_ranges,
+                    // because sink_context can internally call sink_matched
+                    // (e.g., from after_context_by_line when the match limit
+                    // is exceeded), which would consume and clear the ranges
+                    // meant for the actual match below.
+                    let pending =
+                        std::mem::take(&mut self.pending_match_ranges);
+                    self.pending_match_ranges
+                        .push(mat.start()..mat.end());
                     self.last_match = Some(line);
                     if !self.sink_context(&last_match)? {
                         return Ok(false);
                     }
+                    self.core.set_match_ranges(&pending);
                     self.sink_matched(&last_match)
                 }
             }

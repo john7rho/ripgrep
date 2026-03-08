@@ -34,6 +34,8 @@ pub(crate) struct Core<'s, M: 's, S> {
     has_sunk: bool,
     has_matched: bool,
     count: u64,
+    match_ranges: Vec<std::ops::Range<usize>>,
+    adjusted_match_ranges: Vec<std::ops::Range<usize>>,
 }
 
 impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
@@ -61,6 +63,8 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             has_sunk: false,
             has_matched: false,
             count: 0,
+            match_ranges: Vec::new(),
+            adjusted_match_ranges: Vec::new(),
         };
         if !core.searcher.multi_line_with_matcher(&core.matcher) {
             if core.is_line_by_line_fast() {
@@ -94,6 +98,14 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
 
     pub(crate) fn matcher(&self) -> &M {
         &self.matcher
+    }
+
+    pub(crate) fn set_match_ranges(
+        &mut self,
+        ranges: &[std::ops::Range<usize>],
+    ) {
+        self.match_ranges.clear();
+        self.match_ranges.extend_from_slice(ranges);
     }
 
     pub(crate) fn matched(
@@ -533,6 +545,19 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         self.count_lines(buf, range.start());
         let offset = self.absolute_byte_offset + range.start() as u64;
         let linebuf = &buf[*range];
+        // Adjust match_ranges to be relative to `linebuf` (i.e., relative
+        // to range.start() in buf). Also clamp to the line boundaries.
+        // We use a separate Vec so the originals are not corrupted if
+        // sink_matched is called again (e.g., from after_context_by_line).
+        let range_start = range.start();
+        let range_end = range.end();
+        self.adjusted_match_ranges.clear();
+        for r in self.match_ranges.iter() {
+            self.adjusted_match_ranges.push(
+                r.start.saturating_sub(range_start)
+                    ..r.end.saturating_sub(range_start).min(range_end - range_start),
+            );
+        }
         let keepgoing = self.sink.matched(
             &self.searcher,
             &SinkMatch {
@@ -542,8 +567,14 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                 line_number: self.line_number,
                 buffer: buf,
                 bytes_range_in_buffer: range.start()..range.end(),
+                match_ranges: &self.adjusted_match_ranges,
             },
         )?;
+        // Clear match_ranges after use so that stale ranges are never
+        // accidentally reused by a subsequent sink_matched call that
+        // was not preceded by set_match_ranges (e.g., from
+        // after_context_by_line).
+        self.match_ranges.clear();
         if !keepgoing {
             return Ok(false);
         }

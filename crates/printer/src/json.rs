@@ -649,8 +649,18 @@ impl<'p, 's, M: Matcher, W: io::Write> JSONSink<'p, 's, M, W> {
         searcher: &Searcher,
         bytes: &[u8],
         range: std::ops::Range<usize>,
+        match_ranges: &[std::ops::Range<usize>],
     ) -> io::Result<()> {
         self.json.matches.clear();
+        // If the searcher already provided match positions, use them
+        // directly to avoid re-executing the regex.
+        if !match_ranges.is_empty() {
+            let matches = &mut self.json.matches;
+            for r in match_ranges {
+                matches.push(Match::new(r.start, r.end));
+            }
+            return Ok(());
+        }
         // If printing requires knowing the location of each individual match,
         // then compute and stored those right now for use later. While this
         // adds an extra copy for storing the matches, we do amortize the
@@ -731,6 +741,7 @@ impl<'p, 's, M: Matcher, W: io::Write> Sink for JSONSink<'p, 's, M, W> {
             searcher,
             mat.buffer(),
             mat.bytes_range_in_buffer(),
+            mat.match_ranges(),
         )?;
         self.replace(searcher, mat.buffer(), mat.bytes_range_in_buffer())?;
         self.stats.add_matches(self.json.matches.len() as u64);
@@ -761,7 +772,7 @@ impl<'p, 's, M: Matcher, W: io::Write> Sink for JSONSink<'p, 's, M, W> {
         self.json.matches.clear();
 
         let submatches = if searcher.invert_match() {
-            self.record_matches(searcher, ctx.bytes(), 0..ctx.bytes().len())?;
+            self.record_matches(searcher, ctx.bytes(), 0..ctx.bytes().len(), &[])?;
             self.replace(searcher, ctx.bytes(), 0..ctx.bytes().len())?;
             SubMatches::new(
                 ctx.bytes(),

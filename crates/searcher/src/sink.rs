@@ -370,6 +370,7 @@ pub struct SinkMatch<'b> {
     pub(crate) line_number: Option<u64>,
     pub(crate) buffer: &'b [u8],
     pub(crate) bytes_range_in_buffer: std::ops::Range<usize>,
+    pub(crate) match_ranges: &'b [std::ops::Range<usize>],
 }
 
 impl<'b> SinkMatch<'b> {
@@ -422,6 +423,20 @@ impl<'b> SinkMatch<'b> {
     #[inline]
     pub fn bytes_range_in_buffer(&self) -> std::ops::Range<usize> {
         self.bytes_range_in_buffer.clone()
+    }
+
+    /// Returns the individual match ranges within [`SinkMatch::bytes`],
+    /// if available from the searcher.
+    ///
+    /// Each range is relative to the start of [`SinkMatch::bytes`]. When
+    /// non-empty, these represent the exact positions of each regex match
+    /// found by the searcher, which can be used to avoid re-searching.
+    ///
+    /// This may be empty if the searcher does not provide match positions
+    /// (e.g., for line-by-line searching).
+    #[inline]
+    pub fn match_ranges(&self) -> &[std::ops::Range<usize>] {
+        self.match_ranges
     }
 }
 

@@ -773,6 +773,11 @@ impl<'p, 's, M: Matcher, W: WriteColor> StandardSink<'p, 's, M, W> {
 impl<'p, 's, M: Matcher, W: WriteColor> Sink for StandardSink<'p, 's, M, W> {
     type Error = io::Error;
 
+    #[inline]
+    fn requires_match_granularity(&self) -> bool {
+        self.needs_match_granularity
+    }
+
     fn matched(
         &mut self,
         searcher: &Searcher,

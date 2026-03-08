@@ -127,6 +127,17 @@ pub trait Sink {
         _mat: &SinkMatch<'_>,
     ) -> Result<bool, Self::Error>;
 
+    /// Returns true when this sink needs the searcher to preserve individual
+    /// match offsets for each reported match block.
+    ///
+    /// This is primarily useful for multiline searching, where collecting and
+    /// adjusting per-match ranges adds measurable overhead. Most sinks don't
+    /// need that data, so the default is `false`.
+    #[inline]
+    fn requires_match_granularity(&self) -> bool {
+        false
+    }
+
     /// This method is called whenever a context line is found, and is optional
     /// to implement. By default, it does nothing and returns `true`.
     ///
@@ -232,6 +243,11 @@ impl<'a, S: Sink> Sink for &'a mut S {
         mat: &SinkMatch<'_>,
     ) -> Result<bool, S::Error> {
         (**self).matched(searcher, mat)
+    }
+
+    #[inline]
+    fn requires_match_granularity(&self) -> bool {
+        (**self).requires_match_granularity()
     }
 
     #[inline]

@@ -729,6 +729,11 @@ impl<'p, 's, M: Matcher, W: io::Write> JSONSink<'p, 's, M, W> {
 impl<'p, 's, M: Matcher, W: io::Write> Sink for JSONSink<'p, 's, M, W> {
     type Error = io::Error;
 
+    #[inline]
+    fn requires_match_granularity(&self) -> bool {
+        true
+    }
+
     fn matched(
         &mut self,
         searcher: &Searcher,

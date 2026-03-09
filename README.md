@@ -2,7 +2,7 @@ blitzgrep
 ------------
 blitzgrep is a fork of ripgrep optimized for ARM (Apple M-series architecture). it is designed as a drop-in replacement.
 
-developed by byzantinelabs.ai team
+developed by [Byzantine Labs](https://www.byzantinelabs.ai) team
 
 ripgrep is a line-oriented search tool that recursively searches the current
 directory for a regex pattern. By default, ripgrep will respect gitignore rules

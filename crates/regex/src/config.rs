@@ -91,6 +91,39 @@ impl Config {
         analysis.any_literal() && !analysis.any_uppercase()
     }
 
+    /// Returns whether the given patterns are ASCII-only literals that can
+    /// be case-folded directly into HIR character classes, bypassing the
+    /// full regex parse/translate path. This enables the regex engine to
+    /// extract literals for its prefilter even when case_insensitive is on.
+    fn is_ascii_case_insensitive_literals<P: AsRef<str>>(
+        &self,
+        patterns: &[P],
+    ) -> bool {
+        // Only handle explicit case_insensitive, not case_smart.
+        // case_smart requires AST analysis to determine if the pattern
+        // actually needs case-insensitive matching, which defeats the
+        // purpose of bypassing the parser.
+        if !self.case_insensitive {
+            return false;
+        }
+        for p in patterns.iter() {
+            let p = p.as_ref();
+            // Must be all ASCII with no regex metacharacters. ASCII case
+            // folding (a↔A) is identical regardless of unicode mode, so
+            // this is safe for both unicode and non-unicode configs.
+            if !p.is_ascii() || p.chars().any(regex_syntax::is_meta_character)
+            {
+                return false;
+            }
+            if let Some(lineterm) = self.line_terminator {
+                if has_line_terminator(lineterm, p) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Returns whether the given patterns should be treated as "fixed strings"
     /// literals. This is different from just querying the `fixed_strings` knob
     /// in that if the knob is false, this will still return true in some cases
@@ -178,6 +211,16 @@ impl ConfiguredHIR {
             );
             let hir = Hir::alternation(alts);
             hir
+        } else if config.is_ascii_case_insensitive_literals(patterns) {
+            let mut alts = vec![];
+            for p in patterns.iter() {
+                alts.push(build_ascii_case_folded_hir(p.as_ref()));
+            }
+            log::debug!(
+                "assembling HIR from {} ASCII case-folded literals",
+                alts.len()
+            );
+            Hir::alternation(alts)
         } else {
             let mut alts = vec![];
             for p in patterns.iter() {
@@ -343,6 +386,27 @@ impl ConfiguredHIR {
     fn line_anchor_end(&self) -> hir::Look {
         if self.config.crlf { hir::Look::EndCRLF } else { hir::Look::EndLF }
     }
+}
+
+/// Build an HIR that matches the given ASCII literal case-insensitively by
+/// expanding each alphabetic byte into a character class (e.g. `a` → `[aA]`).
+/// Non-alphabetic bytes become plain literals.
+fn build_ascii_case_folded_hir(pattern: &str) -> Hir {
+    let mut parts = vec![];
+    for &byte in pattern.as_bytes() {
+        if byte.is_ascii_alphabetic() {
+            let lo = byte.to_ascii_lowercase();
+            let hi = byte.to_ascii_uppercase();
+            let class = hir::ClassBytes::new(vec![
+                hir::ClassBytesRange::new(lo, lo),
+                hir::ClassBytesRange::new(hi, hi),
+            ]);
+            parts.push(Hir::class(hir::Class::Bytes(class)));
+        } else {
+            parts.push(Hir::literal([byte]));
+        }
+    }
+    Hir::concat(parts)
 }
 
 /// Returns true if the given literal string contains any byte from the line

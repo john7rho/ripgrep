@@ -1,4 +1,5 @@
 use grep_matcher::Matcher;
+use smallvec::SmallVec;
 
 use crate::{
     line_buffer::{DEFAULT_BUFFER_CAPACITY, LineBufferReader},
@@ -6,6 +7,8 @@ use crate::{
     searcher::{Config, Range, Searcher, core::Core},
     sink::{Sink, SinkError},
 };
+
+type MatchRanges = SmallVec<[std::ops::Range<usize>; 4]>;
 
 #[derive(Debug)]
 pub(crate) struct ReadByLine<'s, M, R, S> {
@@ -144,7 +147,7 @@ pub(crate) struct MultiLine<'s, M, S> {
     core: Core<'s, M, S>,
     slice: &'s [u8],
     last_match: Option<Range>,
-    pending_match_ranges: Vec<std::ops::Range<usize>>,
+    pending_match_ranges: MatchRanges,
 }
 
 impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
@@ -161,7 +164,7 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
             core: Core::new(searcher, matcher, write_to, true),
             slice,
             last_match: None,
-            pending_match_ranges: Vec::new(),
+            pending_match_ranges: MatchRanges::new(),
         }
     }
 
@@ -275,7 +278,7 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
                     let pending = if self.core.needs_match_granularity() {
                         std::mem::take(&mut self.pending_match_ranges)
                     } else {
-                        Vec::new()
+                        MatchRanges::new()
                     };
                     if self.core.needs_match_granularity() {
                         self.pending_match_ranges.push(mat.start()..mat.end());

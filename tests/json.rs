@@ -439,3 +439,49 @@ rgtest!(r1412_look_behind_match_missing, |dir: Dir, mut cmd: TestCommand| {
     assert_eq!(m.lines, Data::text("bar\n"));
     assert_eq!(m.submatches.len(), 1);
 });
+
+rgtest!(
+    multiline_grouped_submatches_with_context,
+    |dir: Dir, mut cmd: TestCommand| {
+        dir.create("test", "abc\ndefxxxabc\ndefxxx\nzzz\n");
+
+        let msgs = json_decode(
+            &cmd.arg("--json").arg("-U").arg("-A1").arg("abc\ndef").stdout(),
+        );
+        assert_eq!(msgs.len(), 5);
+
+        let m = msgs[1].unwrap_match();
+        assert_eq!(m.path, Some(Data::text("test")));
+        assert_eq!(m.lines, Data::text("abc\ndefxxxabc\ndefxxx\n"));
+        assert_eq!(m.line_number, Some(1));
+        assert_eq!(m.absolute_offset, 0);
+        assert_eq!(
+            m.submatches,
+            vec![
+                SubMatch {
+                    m: Data::text("abc\ndef"),
+                    replacement: None,
+                    start: 0,
+                    end: 7,
+                },
+                SubMatch {
+                    m: Data::text("abc\ndef"),
+                    replacement: None,
+                    start: 10,
+                    end: 17,
+                },
+            ],
+        );
+
+        assert_eq!(
+            msgs[2].unwrap_context(),
+            Context {
+                path: Some(Data::text("test")),
+                lines: Data::text("zzz\n"),
+                line_number: Some(4),
+                absolute_offset: 21,
+                submatches: vec![],
+            }
+        );
+    }
+);

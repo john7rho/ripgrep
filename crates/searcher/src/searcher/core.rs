@@ -1,6 +1,7 @@
 use bstr::ByteSlice;
 
 use grep_matcher::{LineMatchKind, Matcher};
+use smallvec::SmallVec;
 
 use crate::{
     line_buffer::BinaryDetection,
@@ -16,6 +17,8 @@ enum FastMatchResult {
     Stop,
     SwitchToSlow,
 }
+
+type MatchRanges = SmallVec<[std::ops::Range<usize>; 4]>;
 
 #[derive(Debug)]
 pub(crate) struct Core<'s, M: 's, S> {
@@ -35,8 +38,8 @@ pub(crate) struct Core<'s, M: 's, S> {
     has_matched: bool,
     count: u64,
     needs_match_granularity: bool,
-    match_ranges: Vec<std::ops::Range<usize>>,
-    adjusted_match_ranges: Vec<std::ops::Range<usize>>,
+    match_ranges: MatchRanges,
+    adjusted_match_ranges: MatchRanges,
 }
 
 impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
@@ -66,8 +69,8 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             has_matched: false,
             count: 0,
             needs_match_granularity,
-            match_ranges: Vec::new(),
-            adjusted_match_ranges: Vec::new(),
+            match_ranges: MatchRanges::new(),
+            adjusted_match_ranges: MatchRanges::new(),
         };
         if !core.searcher.multi_line_with_matcher(&core.matcher) {
             if core.is_line_by_line_fast() {
@@ -111,11 +114,8 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         &mut self,
         ranges: &[std::ops::Range<usize>],
     ) {
-        if !self.needs_match_granularity {
-            return;
-        }
         self.match_ranges.clear();
-        self.match_ranges.extend_from_slice(ranges);
+        self.match_ranges.extend(ranges.iter().cloned());
     }
 
     pub(crate) fn matched(
@@ -558,7 +558,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         let match_ranges = if self.needs_match_granularity {
             // Adjust match_ranges to be relative to `linebuf` (i.e., relative
             // to range.start() in buf). Also clamp to the line boundaries.
-            // We use a separate Vec so the originals are not corrupted if
+            // We use a separate buffer so the originals are not corrupted if
             // sink_matched is called again (e.g., from after_context_by_line).
             let range_start = range.start();
             let range_end = range.end();
@@ -587,13 +587,11 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                 match_ranges,
             },
         )?;
-        if self.needs_match_granularity {
-            // Clear match_ranges after use so that stale ranges are never
-            // accidentally reused by a subsequent sink_matched call that
-            // was not preceded by set_match_ranges (e.g., from
-            // after_context_by_line).
-            self.match_ranges.clear();
-        }
+        // Clear match_ranges after use so that stale ranges are never
+        // accidentally reused by a subsequent sink_matched call that
+        // was not preceded by set_match_ranges (e.g., from
+        // after_context_by_line).
+        self.match_ranges.clear();
         if !keepgoing {
             return Ok(false);
         }

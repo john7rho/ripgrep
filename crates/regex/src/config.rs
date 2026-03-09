@@ -12,6 +12,21 @@ use crate::{
     strip::strip_from_match,
 };
 
+/// Lookup table: true if the ASCII byte has non-ASCII Unicode case folds.
+/// From Unicode 16.0 CaseFolding.txt:
+///   K (0x4B) / k (0x6B) → U+212A KELVIN SIGN
+///   S (0x53) / s (0x73) → U+017F LATIN SMALL LETTER LONG S
+/// These are the only ASCII bytes where Unicode simple case folding differs
+/// from ASCII case folding. This set has been stable since Unicode 1.0.
+const ASCII_HAS_UNICODE_FOLD: [bool; 128] = {
+    let mut t = [false; 128];
+    t[b'K' as usize] = true;
+    t[b'S' as usize] = true;
+    t[b'k' as usize] = true;
+    t[b's' as usize] = true;
+    t
+};
+
 /// Config represents the configuration of a regex matcher in this crate.
 /// The configuration is itself a rough combination of the knobs found in
 /// the `regex` crate itself, along with additional `grep-matcher` specific
@@ -106,13 +121,19 @@ impl Config {
         if !self.case_insensitive {
             return false;
         }
-        // When unicode mode is enabled, the standard regex translator
-        // applies full Unicode case folding (e.g. 'k' also matches 'K'
-        // U+212A KELVIN SIGN). Our ASCII-only expansion would miss those
-        // equivalences, so we only take this fast path when unicode is
-        // disabled.
+        // When unicode mode is enabled, some ASCII letters have non-ASCII
+        // Unicode case folds (k→U+212A, s→U+017F). Our ASCII-only
+        // expansion would miss those equivalences, so reject patterns
+        // containing those specific bytes. For all other ASCII bytes,
+        // ASCII and Unicode case folding are identical.
         if self.unicode {
-            return false;
+            for p in patterns.iter() {
+                if p.as_ref().as_bytes().iter().any(|&b| {
+                    (b as usize) < 128 && ASCII_HAS_UNICODE_FOLD[b as usize]
+                }) {
+                    return false;
+                }
+            }
         }
         // When verbose mode is enabled, whitespace and comments have
         // special meaning in the regex parser. Since we bypass the parser

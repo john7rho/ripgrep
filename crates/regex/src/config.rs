@@ -114,6 +114,12 @@ impl Config {
         if self.unicode {
             return false;
         }
+        // When verbose mode is enabled, whitespace and comments have
+        // special meaning in the regex parser. Since we bypass the parser
+        // on this path, we must not take it.
+        if self.ignore_whitespace {
+            return false;
+        }
         for p in patterns.iter() {
             let p = p.as_ref();
             // Must be all ASCII with no regex metacharacters.

@@ -106,14 +106,28 @@ impl Config {
         if !self.case_insensitive {
             return false;
         }
+        // When unicode mode is enabled, the standard regex translator
+        // applies full Unicode case folding (e.g. 'k' also matches 'K'
+        // U+212A KELVIN SIGN). Our ASCII-only expansion would miss those
+        // equivalences, so we only take this fast path when unicode is
+        // disabled.
+        if self.unicode {
+            return false;
+        }
         for p in patterns.iter() {
             let p = p.as_ref();
-            // Must be all ASCII with no regex metacharacters. ASCII case
-            // folding (a↔A) is identical regardless of unicode mode, so
-            // this is safe for both unicode and non-unicode configs.
+            // Must be all ASCII with no regex metacharacters.
             if !p.is_ascii() || p.chars().any(regex_syntax::is_meta_character)
             {
                 return false;
+            }
+            // Reject patterns containing a banned byte (typically NUL for
+            // binary detection). The normal regex path runs ban::check on
+            // the HIR; since we bypass that path we must guard here.
+            if let Some(banned) = self.ban {
+                if p.as_bytes().iter().any(|&b| b == banned) {
+                    return false;
+                }
             }
             if let Some(lineterm) = self.line_terminator {
                 if has_line_terminator(lineterm, p) {

@@ -122,24 +122,6 @@ def is_apple_silicon() -> bool:
     return is_arm() and is_macos()
 
 
-def taskpolicy_available() -> bool:
-    """Check if taskpolicy is available on this system."""
-    return shutil.which('taskpolicy') is not None
-
-
-def wrap_with_taskpolicy(cmd: List[str]) -> List[str]:
-    """Return the command unchanged (taskpolicy wrapping disabled).
-
-    Previously this attempted 'taskpolicy -c user-interactive', but the
-    -c (clamp) flag only accepts 'utility', 'background', or 'maintenance'
-    — it can only lower QoS, not raise it.  Processes already run at default
-    QoS which preferentially schedules on P-cores, so no wrapping is needed.
-
-    The function is retained (rather than deleted) so that call sites do not
-    need modification; it simply acts as an identity function.
-    """
-    return cmd
-
 
 def check_background_interference() -> List[str]:
     """Check for background processes that may interfere with benchmarks.
@@ -866,7 +848,7 @@ def _exact_u_p_value(u_stat: float, n1: int, n2: int) -> float:
         return count_le(u - b, a - 1, b) + count_le(u, a, b - 1)
 
     total = math.comb(n1 + n2, n1)
-    u_int = int(u_stat)
+    u_int = int(round(u_stat))
 
     # Two-tailed: P(U <= u_stat) for both tails
     left_count = count_le(u_int, n1, n2)
@@ -1081,7 +1063,6 @@ class BenchmarkRunner:
         thermal: ThermalMonitor,
         cache_mode: str = 'warm',
         use_sudo: bool = False,
-        use_taskpolicy: bool = False,
         convergence_threshold: float = 0.05,
     ) -> None:
         self.rg_bin = rg_bin
@@ -1090,13 +1071,6 @@ class BenchmarkRunner:
         self.cache_mode = cache_mode
         self.use_sudo = use_sudo
         self.convergence_threshold = convergence_threshold
-        self.use_taskpolicy = use_taskpolicy and taskpolicy_available()
-        if use_taskpolicy and not self.use_taskpolicy:
-            eprint('WARNING: taskpolicy not available on this system. '
-                   'Scheduler hints will not be applied.')
-        if self.use_taskpolicy:
-            eprint('NOTE: taskpolicy scheduling hints applied but core residency '
-                   'cannot be verified. Results assume P-core execution.')
 
     @staticmethod
     def _thermal_severity(state: str) -> int:
@@ -1151,10 +1125,7 @@ class BenchmarkRunner:
             for cfg in group.configs:
                 if self.cache_mode == 'cold':
                     purge_cache(self.use_sudo)
-                cmd = cfg.cmd
-                if self.use_taskpolicy:
-                    cmd = wrap_with_taskpolicy(cmd)
-                timing = run_timed(cmd, cwd=cfg.cwd, count_lines=False)
+                timing = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=False)
                 # Track last 3 times
                 last_times[cfg.name].append(timing.wall_time)
                 if len(last_times[cfg.name]) > 3:
@@ -1179,12 +1150,7 @@ class BenchmarkRunner:
                 break
             eprint('  [warmup] Not converged, running extra warmup %d...' % (extra + 1))
             for cfg in group.configs:
-                if self.cache_mode == 'cold':
-                    purge_cache(self.use_sudo)
-                cmd = cfg.cmd
-                if self.use_taskpolicy:
-                    cmd = wrap_with_taskpolicy(cmd)
-                timing = run_timed(cmd, cwd=cfg.cwd, count_lines=False)
+                timing = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=False)
                 last_times[cfg.name].append(timing.wall_time)
                 if len(last_times[cfg.name]) > 3:
                     last_times[cfg.name] = last_times[cfg.name][-3:]
@@ -1246,10 +1212,9 @@ class BenchmarkRunner:
         sample_count = max(cfg.samples for cfg in group.configs)
         warmup_count = max(cfg.warmups for cfg in group.configs)
 
-        # Correctness pass: capture expected line counts using the raw
-        # command (no taskpolicy, no timing).  This is a pure correctness
-        # check — it must not go through the performance path because
-        # taskpolicy swallows child stdout on macOS.
+        # Correctness pass: capture expected line counts.  This is a pure
+        # correctness check — it runs with count_lines=True (stdout piped)
+        # before any performance measurements begin.
         eprint('  Capturing expected line counts...')
         for cfg in group.configs:
             verification = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=True)
@@ -1279,14 +1244,9 @@ class BenchmarkRunner:
                 # Get CPU frequency before run (if available)
                 cpu_freq = self.thermal.get_cpu_frequency()
 
-                # Apply taskpolicy wrapping if enabled
-                cmd = cfg.cmd
-                if self.use_taskpolicy:
-                    cmd = wrap_with_taskpolicy(cmd)
-
                 # count_lines=False: send stdout to /dev/null to avoid
                 # pipe I/O overhead inflating wall time measurements
-                timing = run_timed(cmd, cwd=cfg.cwd, count_lines=False)
+                timing = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=False)
 
                 # Check thermal state after run; record the worse of the two
                 _, thermal_after = self.thermal.check_throttling()
@@ -1302,20 +1262,21 @@ class BenchmarkRunner:
                 br.thermal_states.append(thermal_state)
                 br.cpu_frequencies.append(cpu_freq)
 
-                # Periodic correctness verification: every 5th sample,
-                # run with count_lines=True and compare to warmup line count
-                if (s + 1) % 5 == 0 and br.line_counts:
-                    expected_lc = br.line_counts[0]
-                    if expected_lc is not None:
-                        verify = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=True)
-                        if verify.line_count is not None and verify.line_count != expected_lc:
-                            eprint(
-                                '  WARNING: Correctness check failed for %s '
-                                'at sample %d: expected %d lines, got %d'
-                                % (cfg.name, s + 1, expected_lc, verify.line_count)
-                            )
-
             eprint('  [%d/%d] done' % (s + 1, sample_count))
+
+        # Post-measurement correctness verification
+        for cfg in group.configs:
+            br = result.results[cfg.name]
+            if br.line_counts:
+                expected_lc = br.line_counts[0]
+                if expected_lc is not None:
+                    verify = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=True)
+                    if verify.line_count is not None and verify.line_count != expected_lc:
+                        eprint(
+                            '  WARNING: Post-measurement correctness check failed for %s: '
+                            'expected %d lines, got %d'
+                            % (cfg.name, expected_lc, verify.line_count)
+                        )
 
         # Report thermal tainting
         for cfg in group.configs:
@@ -1362,8 +1323,51 @@ class BenchmarkRunner:
 # ---------------------------------------------------------------------------
 
 
+def _adaptive_thread_counts(system_info: Optional[Dict[str, Any]] = None) -> List[int]:
+    """Generate thread counts based on the system's P-core count.
+
+    Reads P-core count from system_info['core_topology'], generates thread
+    counts: powers of 2 up to P-core count, plus P-core count itself, plus
+    total logical CPUs. Falls back to [1, 2, 4, 6, 8] if no topology info.
+    """
+    if system_info is None:
+        return [1, 2, 4, 6, 8]
+
+    topo = system_info.get('core_topology')
+    if not topo:
+        return [1, 2, 4, 6, 8]
+
+    # Find P-core logical count (level0 is typically Performance on Apple Silicon)
+    p_cores = None
+    for level_key in sorted(topo.keys()):
+        entry = topo.get(level_key)
+        if isinstance(entry, dict):
+            name = entry.get('name', '').lower()
+            if 'performance' in name or name.startswith('p'):
+                p_cores = entry.get('logical')
+                break
+
+    if p_cores is None or p_cores < 1:
+        return [1, 2, 4, 6, 8]
+
+    total_logical = system_info.get('total_logical_cpus') or p_cores
+
+    # Powers of 2 up to P-core count
+    counts = set()
+    counts.add(1)
+    power = 2
+    while power <= p_cores:
+        counts.add(power)
+        power *= 2
+    counts.add(p_cores)
+    counts.add(total_logical)
+
+    return sorted(counts)
+
+
 def scenario_thread_scaling(
-    rg_bin: str, suite_dir: str
+    rg_bin: str, suite_dir: str,
+    system_info: Optional[Dict[str, Any]] = None,
 ) -> BenchmarkGroup:
     """Thread scaling benchmark: compare 1, 2, 4, 6, 8 threads on Linux corpus.
 
@@ -1373,7 +1377,7 @@ def scenario_thread_scaling(
     require_corpus(suite_dir, 'linux')
     cwd = linux_dir(suite_dir)
     pat = 'PM_RESUME'
-    thread_counts = [1, 2, 4, 6, 8]
+    thread_counts = _adaptive_thread_counts(system_info)
 
     configs = []
     for j in thread_counts:
@@ -1395,7 +1399,8 @@ def scenario_thread_scaling(
 
 
 def scenario_thread_scaling_output(
-    rg_bin: str, suite_dir: str
+    rg_bin: str, suite_dir: str,
+    system_info: Optional[Dict[str, Any]] = None,
 ) -> BenchmarkGroup:
     """Thread scaling benchmark for output-heavy search modes.
 
@@ -1405,7 +1410,7 @@ def scenario_thread_scaling_output(
     """
     require_corpus(suite_dir, 'linux')
     cwd = linux_dir(suite_dir)
-    thread_counts = [1, 2, 4, 6, 8]
+    thread_counts = _adaptive_thread_counts(system_info)
 
     configs = []
     for j in thread_counts:
@@ -1434,7 +1439,8 @@ def scenario_thread_scaling_output(
 
 
 def scenario_mmap_vs_read(
-    rg_bin: str, suite_dir: str
+    rg_bin: str, suite_dir: str,
+    system_info: Optional[Dict[str, Any]] = None,
 ) -> BenchmarkGroup:
     """mmap vs read benchmark on subtitles corpus (large file).
 
@@ -1470,7 +1476,8 @@ def scenario_mmap_vs_read(
 
 
 def scenario_mmap_multiline(
-    rg_bin: str, suite_dir: str
+    rg_bin: str, suite_dir: str,
+    system_info: Optional[Dict[str, Any]] = None,
 ) -> BenchmarkGroup:
     """mmap vs no-mmap in multiline mode on subtitles corpus.
 
@@ -1520,7 +1527,8 @@ def scenario_mmap_multiline(
 
 
 def scenario_multiline_vs_singleline(
-    rg_bin: str, suite_dir: str
+    rg_bin: str, suite_dir: str,
+    system_info: Optional[Dict[str, Any]] = None,
 ) -> BenchmarkGroup:
     """Multiline vs single-line benchmark on Linux corpus.
 
@@ -1573,7 +1581,8 @@ def scenario_multiline_vs_singleline(
 
 
 def scenario_large_file_single_threaded(
-    rg_bin: str, suite_dir: str
+    rg_bin: str, suite_dir: str,
+    system_info: Optional[Dict[str, Any]] = None,
 ) -> BenchmarkGroup:
     """Large file single-threaded benchmark on subtitles corpus.
 
@@ -1616,7 +1625,8 @@ def scenario_large_file_single_threaded(
 
 
 def scenario_directory_io(
-    rg_bin: str, suite_dir: str
+    rg_bin: str, suite_dir: str,
+    system_info: Optional[Dict[str, Any]] = None,
 ) -> BenchmarkGroup:
     """Directory walk I/O benchmark on Linux kernel source.
 
@@ -1704,6 +1714,11 @@ def check_regressions(
     A regression is flagged when the new median is >5% slower
     with p < 0.05 on a Mann-Whitney U test.
     """
+    eprint(
+        'WARNING: Baseline comparison is NOT interleaved A/B. '
+        'Results may be confounded by environmental differences '
+        '(thermal state, background load, OS updates) between runs.'
+    )
     regressions: List[Dict[str, Any]] = []
 
     for gr in group_results:
@@ -1748,6 +1763,8 @@ def check_regressions(
             # where d = Cohen's d = |mean_diff| / pooled_sd
             n1 = len(baseline_times)
             n2 = len(new_times)
+            baseline_mean = statistics.mean(baseline_times)
+            new_mean = statistics.mean(new_times)
             baseline_sd = statistics.stdev(baseline_times) if n1 > 1 else 0.0
             new_sd = statistics.stdev(new_times) if n2 > 1 else 0.0
             pooled_sd = math.sqrt(
@@ -1755,7 +1772,7 @@ def check_regressions(
                 / max(n1 + n2 - 2, 1)
             ) if (baseline_sd > 0 or new_sd > 0) else 0.0
             if pooled_sd > 0:
-                effect_size = abs(new_median - baseline_median) / pooled_sd
+                effect_size = abs(new_mean - baseline_mean) / pooled_sd
                 harmonic_n = 2.0 * n1 * n2 / (n1 + n2)
                 z_alpha = 1.96  # two-tailed alpha = 0.05
                 noncentrality = effect_size * math.sqrt(harmonic_n / 2.0)
@@ -1844,11 +1861,11 @@ def write_csv(
                     writer.writerow({
                         'benchmark': gr.group.name,
                         'warmup_iter': cfg.warmups,
-                        'iter': cfg.samples,
+                        'iter': i,
                         'name': cfg.name,
                         'command': ' '.join(cfg.cmd),
                         'duration': wt,
-                        'lines': br.line_counts[i] if i < len(br.line_counts) else '',
+                        'lines': br.line_counts[0] if br.line_counts else '',
                         'env': '',
                         'chip': chip,
                         'cores_used': cores_used,
@@ -1970,6 +1987,11 @@ def format_summary(
                     % (entry['name'], entry.get('logical', '?'),
                        entry.get('physical', '?'))
                 )
+    if system_info.get('is_apple_silicon'):
+        lines.append(
+            '  NOTE: macOS does not expose CPU core pinning APIs. '
+            'Benchmarks rely on the OS scheduler for P-core placement.'
+        )
     lines.append('')
 
     # Benchmark results
@@ -2032,6 +2054,9 @@ def format_summary(
     if regressions:
         lines.append('REGRESSION ANALYSIS')
         lines.append('-' * 40)
+        lines.append('  NOTE: Baseline comparison is NOT interleaved A/B.')
+        lines.append('  Results may be confounded by environmental differences.')
+        lines.append('')
         any_regression = False
         for r in regressions:
             status = 'REGRESSION' if r['is_regression'] else 'OK'
@@ -2099,7 +2124,8 @@ Examples:
     )
     p.add_argument(
         '--baseline', metavar='PATH', default=None,
-        help='Path to baseline raw.csv for regression detection.',
+        help='Path to baseline raw.csv for regression detection. '
+             'NOTE: Not interleaved A/B -- may be confounded by environmental differences.',
     )
     p.add_argument(
         '--scenarios', metavar='LIST', default=None,
@@ -2140,10 +2166,6 @@ Examples:
         help='Overwrite existing output files.',
     )
     p.add_argument(
-        '--no-taskpolicy', action='store_true', default=False,
-        help='Disable taskpolicy scheduling hints for P-core bias.',
-    )
-    p.add_argument(
         '--samples', type=int, default=None,
         help='Override default sample count for all scenarios. '
              'Thread-scaling tests use max(--samples, %d).' % THREAD_SCALING_SAMPLES,
@@ -2153,6 +2175,11 @@ Examples:
         help='Convergence threshold for warmup steady-state detection '
              '(default: 0.05). All pairwise differences in the last 3 '
              'warmup times must be within this fraction of the faster time.',
+    )
+    p.add_argument(
+        '--seed', type=int, default=None,
+        help='Random seed for reproducible benchmark ordering. '
+             'If not provided, a seed is generated and recorded in output.',
     )
 
     args = p.parse_args()
@@ -2179,7 +2206,13 @@ Examples:
 
     # Detect system info
     system_info = detect_system_info()
-    system_info['use_taskpolicy'] = False
+
+    # Seed random number generator for reproducibility
+    seed = args.seed if args.seed is not None else random.randrange(2**32)
+    random.seed(seed)
+    system_info['random_seed'] = seed
+    eprint('Random seed: %d' % seed)
+
     eprint('System: %s (%s)' % (
         system_info.get('chip', 'unknown'),
         system_info.get('arch', 'unknown'),
@@ -2285,7 +2318,7 @@ Examples:
     groups: List[BenchmarkGroup] = []
     for name in scenario_names:
         try:
-            group = ALL_SCENARIOS[name](rg_bin, suite_dir)
+            group = ALL_SCENARIOS[name](rg_bin, suite_dir, system_info=system_info)
             # Apply --samples override if provided
             if args.samples is not None:
                 for cfg in group.configs:
@@ -2312,7 +2345,6 @@ Examples:
         thermal=thermal,
         cache_mode=args.cache,
         use_sudo=args.sudo,
-        use_taskpolicy=False,
         convergence_threshold=args.convergence_threshold,
     )
 

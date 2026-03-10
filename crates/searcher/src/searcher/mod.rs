@@ -686,30 +686,31 @@ impl Searcher {
         M: Matcher,
         S: Sink,
     {
-        if let Some(mmap) = self.config.mmap.open(file, path) {
-            // On Apple Silicon, only use mmap when the search will use the
-            // MultiLine strategy. For single-line searches (SliceByLine),
-            // the streaming ReadByLine path is significantly faster because
-            // it keeps the working set in L1/L2 cache rather than faulting
-            // in the entire file via mmap. For true multiline searches, mmap
-            // is faster because it avoids copying the entire file to the heap.
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            {
-                if self.multi_line_with_matcher(&matcher) {
+        // On Apple Silicon, only open mmap for multiline searches.
+        // Single-line searches are faster with streaming ReadByLine
+        // (better L1/L2 cache utilization). Checking the search mode
+        // first avoids a wasted mmap/munmap syscall per file during
+        // directory scans.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if self.multi_line_with_matcher(&matcher) {
+                if let Some(mmap) = self.config.mmap.open(file, path) {
                     log::trace!(
                         "{:?}: searching via memory map (multiline)",
                         path
                     );
                     return self.search_slice(matcher, &mmap, write_to);
                 }
+            } else {
                 log::trace!(
-                    "{:?}: skipping mmap for single-line search on Apple Silicon",
+                    "{:?}: skipping mmap for single-line on Apple Silicon",
                     path
                 );
-                // Fall through to streaming search below.
             }
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            {
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            if let Some(mmap) = self.config.mmap.open(file, path) {
                 log::trace!("{:?}: searching via memory map", path);
                 return self.search_slice(matcher, &mmap, write_to);
             }

@@ -1,8 +1,50 @@
 blitzgrep
 ------------
-blitzgrep is a fork of ripgrep optimized for ARM (Apple M-series architecture). it is designed as a drop-in replacement.
+blitzgrep is a fork of [ripgrep](https://github.com/BurntSushi/ripgrep) optimized for Apple Silicon. it is designed as a drop-in replacement.
 
-developed by [Byzantine Labs](https://www.byzantinelabs.ai) team
+developed by [Byzantine Labs](https://www.byzantinelabs.ai)
+
+
+### Apple Silicon benchmark results (M5, 24 GB, macOS 15.x)
+
+All benchmarks: hyperfine 1.20.0, 20 interleaved A/B runs, 5 warmups, warm cache.
+Upstream: `4519153` (BurntSushi/ripgrep). Fork: `c07f3f8` (john7rho/ripgrep).
+
+| Benchmark | Upstream | Fork | Speedup |
+| --------- | -------- | ---- | ------- |
+| Dir sparse (PM_RESUME) | 1694 ms | 958 ms | **1.77x** |
+| Dir dense (return) | 1851 ms | 996 ms | **1.86x** |
+| Dir no-match | 2055 ms | 813 ms | **2.53x** |
+| Multiline cross-line | 265 ms | 117 ms | **2.27x** |
+| Single-file literal | 159 ms | 158 ms | 1.00x |
+| Multiline literal | 159 ms | 159 ms | 1.00x |
+| No-literal regex | 188 ms | 190 ms | 1.00x |
+
+Directory corpus: Linux kernel source tree (~1.5 GB, ~75K files).
+Single-file corpus: OpenSubtitles en.sample.txt (~1.5 GB).
+
+### What changed
+
+1. **mmap-always on Apple Silicon**: unconditionally enable mmap for directory search on `aarch64-apple-darwin`. Apple Silicon's unified memory makes lazy page faults faster than buffered `read(2)` syscalls. System time drops 76-83% on directory benchmarks.
+
+2. **P-core thread capping**: detect P-core count at runtime via `sysctlbyname("hw.perflevel0.logicalcpu")` and cap the thread pool. On M5 (4P + 6E), 4 threads beats 10 threads because E-cores are stragglers on I/O-bound search.
+
+3. **Multiline match bookkeeping elimination**: skip per-match byte-range tracking in the `Vec` when the downstream sink doesn't need match positions (e.g., `-c` count mode).
+
+Single-file single-line searches are unchanged by design -- the mmap optimization targets directory walks where I/O dominates.
+
+### Reproduce
+
+```
+git clone https://github.com/john7rho/ripgrep && cd ripgrep
+cargo build --profile release-lto
+# download corpora, then:
+hyperfine --warmup 5 --runs 20 \
+  '/path/to/upstream/rg -c PM_RESUME /path/to/linux' \
+  './target/release-lto/rg -c PM_RESUME /path/to/linux'
+```
+
+---
 
 ripgrep is a line-oriented search tool that recursively searches the current
 directory for a regex pattern. By default, ripgrep will respect gitignore rules

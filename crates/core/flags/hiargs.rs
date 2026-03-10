@@ -299,16 +299,30 @@ impl HiArgs {
             // (if the underlying file is truncated while reading it), which
             // will cause ripgrep to abort. This reasoning should be treated as
             // suspect.
-            let maybe = unsafe { grep::searcher::MmapChoice::auto() };
+            let auto = unsafe { grep::searcher::MmapChoice::auto() };
+            let always = unsafe { grep::searcher::MmapChoice::always() };
             let never = grep::searcher::MmapChoice::never();
             match low.mmap {
                 MmapMode::Auto
+                    if cfg!(all(
+                        target_os = "macos",
+                        target_arch = "aarch64"
+                    )) =>
+                {
+                    // On Apple Silicon, unified memory makes mmap
+                    // consistently faster than buffered reads for
+                    // file search, even across many files. The lazy
+                    // page-fault model allows better I/O and compute
+                    // overlap with parallel worker threads.
+                    auto
+                }
+                MmapMode::Auto
                     if should_use_auto_mmap(low.multiline, &paths) =>
                 {
-                    maybe
+                    auto
                 }
                 MmapMode::Auto => never,
-                MmapMode::AlwaysTryMmap => maybe,
+                MmapMode::AlwaysTryMmap => always,
                 MmapMode::Never => never,
             }
         };
@@ -1638,6 +1652,8 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use crate::flags::parse::parse_low_raw;
+
     use super::*;
 
     struct TempDir {
@@ -1728,5 +1744,15 @@ mod tests {
                 is_one_file: true,
             },
         ));
+    }
+
+    #[test]
+    fn explicit_mmap_stays_distinct_from_auto() {
+        let low = parse_low_raw(["--mmap", "foo"]).unwrap();
+        let hi = HiArgs::from_low_args(low).unwrap();
+        assert_eq!(
+            unsafe { grep::searcher::MmapChoice::always() },
+            hi.mmap_choice
+        );
     }
 }

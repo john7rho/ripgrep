@@ -815,7 +815,12 @@ impl<'p, 's, M: Matcher, W: WriteColor> Sink for StandardSink<'p, 's, M, W> {
         self.replacer.clear();
 
         if searcher.invert_match() {
-            self.record_matches(searcher, ctx.bytes(), 0..ctx.bytes().len(), &[])?;
+            self.record_matches(
+                searcher,
+                ctx.bytes(),
+                0..ctx.bytes().len(),
+                &[],
+            )?;
             self.replace(searcher, ctx.bytes(), 0..ctx.bytes().len())?;
         }
         if searcher.binary_detection().convert_byte().is_some() {

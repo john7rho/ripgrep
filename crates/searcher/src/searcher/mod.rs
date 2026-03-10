@@ -464,11 +464,13 @@ impl SearcherBuilder {
 
     /// Set the strategy to employ use of memory maps.
     ///
-    /// Currently, there are only two strategies that can be employed:
+    /// Currently, there are three strategies that can be employed:
     ///
     /// * **Automatic** - A searcher will use heuristics, including but not
     ///   limited to file size and platform, to determine whether to use memory
     ///   maps or not.
+    /// * **Always** - A searcher will use memory maps whenever they are
+    ///   available.
     /// * **Never** - Memory maps will never be used. If multi line search is
     ///   enabled, then the entire contents will be read on to the heap before
     ///   searching begins.
@@ -686,9 +688,44 @@ impl Searcher {
         M: Matcher,
         S: Sink,
     {
-        if let Some(mmap) = self.config.mmap.open(file, path) {
-            log::trace!("{:?}: searching via memory map", path);
-            return self.search_slice(matcher, &mmap, write_to);
+        // On Apple Silicon, only open mmap for multiline searches.
+        // Single-line searches are faster with streaming ReadByLine
+        // (better L1/L2 cache utilization). Checking the search mode
+        // first avoids a wasted mmap/munmap syscall per file during
+        // directory scans.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let use_mmap = if self.config.mmap.is_auto() {
+                self.multi_line_with_matcher(&matcher)
+            } else {
+                true
+            };
+            if use_mmap {
+                if let Some(mmap) = self.config.mmap.open(file, path) {
+                    let mode = if self.multi_line_with_matcher(&matcher) {
+                        "multiline"
+                    } else {
+                        "explicit"
+                    };
+                    log::trace!(
+                        "{:?}: searching via memory map ({mode})",
+                        path
+                    );
+                    return self.search_slice(matcher, &mmap, write_to);
+                }
+            } else {
+                log::trace!(
+                    "{:?}: skipping mmap for single-line on Apple Silicon",
+                    path
+                );
+            }
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            if let Some(mmap) = self.config.mmap.open(file, path) {
+                log::trace!("{:?}: searching via memory map", path);
+                return self.search_slice(matcher, &mmap, write_to);
+            }
         }
         // Fast path for multi-line searches of files when memory maps are not
         // enabled. This pre-allocates a buffer roughly the size of the file,

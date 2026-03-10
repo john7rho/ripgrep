@@ -23,6 +23,8 @@ Upstream: `4519153` (BurntSushi/ripgrep). Fork: `c07f3f8` (john7rho/ripgrep).
 Directory corpus: Linux kernel source tree (~1.5 GB, ~75K files).
 Single-file corpus: OpenSubtitles en.sample.txt (~1.5 GB).
 
+**Note:** Exact speedups vary across runs due to thermal throttling, background processes, and OS-level I/O scheduling. We consistently observe 1.7–2.5x directory speedups across repeated trials, but individual runs may differ by ±15%. Run your own benchmarks on a quiet machine for the most reliable numbers.
+
 ### What changed
 
 1. **mmap-always on Apple Silicon**: unconditionally enable mmap for directory search on `aarch64-apple-darwin`. Apple Silicon's unified memory makes lazy page faults faster than buffered `read(2)` syscalls. System time drops 76-83% on directory benchmarks.

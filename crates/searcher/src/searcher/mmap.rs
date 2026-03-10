@@ -9,12 +9,13 @@ use memmap::Mmap;
 /// believes it will make the search faster.
 ///
 /// By default, memory maps are disabled.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MmapChoice(MmapChoiceImpl);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum MmapChoiceImpl {
     Auto,
+    Always,
     Never,
 }
 
@@ -48,6 +49,18 @@ impl MmapChoice {
     /// memory map.
     pub unsafe fn auto() -> MmapChoice {
         MmapChoice(MmapChoiceImpl::Auto)
+    }
+
+    /// Always use memory maps when possible.
+    ///
+    /// If memory maps are unavailable or cannot be used for a specific input,
+    /// then normal OS read calls are used instead.
+    ///
+    /// # Safety
+    ///
+    /// This has the same safety requirements as [`MmapChoice::auto`].
+    pub unsafe fn always() -> MmapChoice {
+        MmapChoice(MmapChoiceImpl::Always)
     }
 
     /// Never use memory maps, no matter what. This is the default.
@@ -94,8 +107,25 @@ impl MmapChoice {
     /// Whether this strategy may employ memory maps or not.
     pub(crate) fn is_enabled(&self) -> bool {
         match self.0 {
-            MmapChoiceImpl::Auto => true,
+            MmapChoiceImpl::Auto | MmapChoiceImpl::Always => true,
             MmapChoiceImpl::Never => false,
         }
+    }
+
+    /// Whether this strategy uses memory maps opportunistically.
+    pub(crate) fn is_auto(&self) -> bool {
+        matches!(self.0, MmapChoiceImpl::Auto)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MmapChoice;
+
+    #[test]
+    fn explicit_mmap_is_not_auto() {
+        assert!(unsafe { MmapChoice::auto() }.is_auto());
+        assert!(!unsafe { MmapChoice::always() }.is_auto());
+        assert!(!MmapChoice::never().is_auto());
     }
 }

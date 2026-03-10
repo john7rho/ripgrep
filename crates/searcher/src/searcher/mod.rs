@@ -464,11 +464,13 @@ impl SearcherBuilder {
 
     /// Set the strategy to employ use of memory maps.
     ///
-    /// Currently, there are only two strategies that can be employed:
+    /// Currently, there are three strategies that can be employed:
     ///
     /// * **Automatic** - A searcher will use heuristics, including but not
     ///   limited to file size and platform, to determine whether to use memory
     ///   maps or not.
+    /// * **Always** - A searcher will use memory maps whenever they are
+    ///   available.
     /// * **Never** - Memory maps will never be used. If multi line search is
     ///   enabled, then the entire contents will be read on to the heap before
     ///   searching begins.
@@ -693,10 +695,20 @@ impl Searcher {
         // directory scans.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            if self.multi_line_with_matcher(&matcher) {
+            let use_mmap = if self.config.mmap.is_auto() {
+                self.multi_line_with_matcher(&matcher)
+            } else {
+                true
+            };
+            if use_mmap {
                 if let Some(mmap) = self.config.mmap.open(file, path) {
+                    let mode = if self.multi_line_with_matcher(&matcher) {
+                        "multiline"
+                    } else {
+                        "explicit"
+                    };
                     log::trace!(
-                        "{:?}: searching via memory map (multiline)",
+                        "{:?}: searching via memory map ({mode})",
                         path
                     );
                     return self.search_slice(matcher, &mmap, write_to);

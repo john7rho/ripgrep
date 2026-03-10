@@ -75,6 +75,9 @@ CV_THRESHOLD_MULTI_FILE = 0.12  # 12% for multi-file/thread-scaling benchmarks
 REGRESSION_THRESHOLD = 0.05  # 5% slower
 REGRESSION_P_VALUE = 0.05
 COOLDOWN_MIN_SECONDS = 30
+DEFAULT_SAMPLE_RETRIES = 6
+RETRY_COOLDOWN_SECONDS = 10
+MIN_COMPARISON_SAMPLES = 5
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -124,25 +127,28 @@ def is_apple_silicon() -> bool:
 
 
 
-def check_background_interference() -> List[str]:
+def check_background_interference(target_path: Optional[str] = None) -> List[str]:
     """Check for background processes that may interfere with benchmarks.
 
     Checks for Spotlight indexing and Time Machine activity.
     Returns a list of warning strings (empty if no interference detected).
     """
     interference_warnings: List[str] = []
+    spotlight_target = target_path if target_path and path.exists(target_path) else '/'
 
     # Check Spotlight indexing
     try:
         result = subprocess.run(
-            ['mdutil', '-s', '/'],
+            ['mdutil', '-s', spotlight_target],
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode == 0 and 'Indexing enabled' in result.stdout:
             interference_warnings.append(
-                'Spotlight indexing is enabled on /. This may cause I/O '
+                'Spotlight indexing is enabled for %s. This may cause I/O '
                 'interference during directory-walk benchmarks. Consider '
-                'disabling with: sudo mdutil -i off /'
+                'disabling it on the benchmark volume with: '
+                'sudo mdutil -i off %s'
+                % (spotlight_target, spotlight_target)
             )
     except Exception:
         pass
@@ -1116,6 +1122,48 @@ class BenchmarkResult:
         """Return the number of suspected outliers."""
         return len(self.outlier_indices)
 
+    @property
+    def clean_sample_indices(self) -> List[int]:
+        """Return indices of samples not tainted by heat or outlier detection."""
+        rejected = set(self.throttled_sample_indices)
+        rejected.update(self.outlier_indices)
+        return [i for i in range(len(self.wall_times)) if i not in rejected]
+
+    @property
+    def clean_wall_times(self) -> List[float]:
+        """Return wall times for clean samples only."""
+        return [self.wall_times[i] for i in self.clean_sample_indices]
+
+    @property
+    def clean_sample_count(self) -> int:
+        """Return the number of clean samples available for analysis."""
+        return len(self.clean_sample_indices)
+
+    @property
+    def clean_stats(self) -> Dict[str, float]:
+        """Compute statistics on clean samples only."""
+        return compute_stats(self.clean_wall_times)
+
+    @property
+    def best_clean_time(self) -> Optional[float]:
+        """Return the best clean sample, or None when no clean samples exist."""
+        clean = self.clean_wall_times
+        if not clean:
+            return None
+        return min(clean)
+
+    @property
+    def comparison_wall_times(self) -> List[float]:
+        """Return the sample set to use for statistical comparisons.
+
+        Prefer clean samples when at least MIN_COMPARISON_SAMPLES survive.
+        Otherwise fall back to the full raw sample set.
+        """
+        clean = self.clean_wall_times
+        if len(clean) >= MIN_COMPARISON_SAMPLES:
+            return clean
+        return self.wall_times
+
 
 class GroupResult:
     """Results for an entire benchmark group."""
@@ -1164,6 +1212,7 @@ class BenchmarkRunner:
         cache_mode: str = 'warm',
         use_sudo: bool = False,
         convergence_threshold: float = 0.05,
+        sample_retries: int = DEFAULT_SAMPLE_RETRIES,
     ) -> None:
         self.rg_bin = rg_bin
         self.suite_dir = suite_dir
@@ -1171,6 +1220,7 @@ class BenchmarkRunner:
         self.cache_mode = cache_mode
         self.use_sudo = use_sudo
         self.convergence_threshold = convergence_threshold
+        self.sample_retries = sample_retries
 
     @staticmethod
     def _thermal_severity(state: str) -> int:
@@ -1296,6 +1346,84 @@ class BenchmarkRunner:
                 ordered[i], ordered[i + 1] = ordered[i + 1], ordered[i]
         return ordered
 
+    def _record_sample(
+        self,
+        br: BenchmarkResult,
+        timing: TimingResult,
+        thermal_state: str,
+        cpu_freq: Optional[Dict[str, int]],
+    ) -> None:
+        """Append one sample to a benchmark result."""
+        br.wall_times.append(timing.wall_time)
+        br.user_times.append(timing.user_time)
+        br.sys_times.append(timing.sys_time)
+        br.thermal_states.append(thermal_state)
+        br.cpu_frequencies.append(cpu_freq)
+
+    def _run_one_sample(
+        self,
+        cfg: BenchmarkConfig,
+        br: BenchmarkResult,
+    ) -> bool:
+        """Run one measured sample, record it, and report taint status."""
+        if self.cache_mode == 'cold':
+            purge_cache(self.use_sudo)
+
+        _, thermal_before = self.thermal.check_throttling()
+        cpu_freq = self.thermal.get_cpu_frequency()
+        timing = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=False)
+        _, thermal_after = self.thermal.check_throttling()
+        if self._thermal_severity(thermal_after) >= self._thermal_severity(thermal_before):
+            thermal_state = thermal_after
+        else:
+            thermal_state = thermal_before
+
+        self._record_sample(br, timing, thermal_state, cpu_freq)
+        return thermal_state not in ('nominal', 'unknown')
+
+    def _run_replacement_samples(
+        self,
+        group: BenchmarkGroup,
+        result: GroupResult,
+        target_clean_samples: int,
+    ) -> None:
+        """Collect replacement samples until each config has enough clean data.
+
+        Clean samples exclude thermal-tainted measurements and post-hoc
+        outliers. Raw samples are retained in the output log; retries only
+        increase the chance that comparisons have a sufficiently clean pool.
+        """
+        for retry_round in range(self.sample_retries):
+            pending = [
+                cfg for cfg in group.configs
+                if result.results[cfg.name].clean_sample_count < target_clean_samples
+            ]
+            if not pending:
+                return
+
+            eprint(
+                '  [retry] Round %d/%d for: %s'
+                % (
+                    retry_round + 1,
+                    self.sample_retries,
+                    ', '.join(cfg.name for cfg in pending),
+                )
+            )
+            saw_thermal_taint = False
+            for cfg in self._balanced_alternation(pending, target_clean_samples + retry_round):
+                br = result.results[cfg.name]
+                if br.clean_sample_count >= target_clean_samples:
+                    continue
+                thermally_tainted = self._run_one_sample(cfg, br)
+                saw_thermal_taint = saw_thermal_taint or thermally_tainted
+
+            if saw_thermal_taint:
+                eprint(
+                    '  [retry] Thermal taint detected during replacement sampling; '
+                    'cooling down before continuing.'
+                )
+                self.thermal.cooldown(RETRY_COOLDOWN_SECONDS)
+
     def run_group(self, group: BenchmarkGroup) -> GroupResult:
         """Run all configs in a benchmark group with interleaved execution.
 
@@ -1335,34 +1463,13 @@ class BenchmarkRunner:
                 configs_order = list(group.configs)
 
             for cfg in configs_order:
-                if self.cache_mode == 'cold':
-                    purge_cache(self.use_sudo)
-
-                # Check thermal state before run
-                _, thermal_before = self.thermal.check_throttling()
-
-                # Get CPU frequency before run (if available)
-                cpu_freq = self.thermal.get_cpu_frequency()
-
-                # count_lines=False: send stdout to /dev/null to avoid
-                # pipe I/O overhead inflating wall time measurements
-                timing = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=False)
-
-                # Check thermal state after run; record the worse of the two
-                _, thermal_after = self.thermal.check_throttling()
-                if self._thermal_severity(thermal_after) >= self._thermal_severity(thermal_before):
-                    thermal_state = thermal_after
-                else:
-                    thermal_state = thermal_before
-
                 br = result.results[cfg.name]
-                br.wall_times.append(timing.wall_time)
-                br.user_times.append(timing.user_time)
-                br.sys_times.append(timing.sys_time)
-                br.thermal_states.append(thermal_state)
-                br.cpu_frequencies.append(cpu_freq)
+                self._run_one_sample(cfg, br)
 
             eprint('  [%d/%d] done' % (s + 1, sample_count))
+
+        # Replacement sampling to recover from thermal taint and obvious outliers.
+        self._run_replacement_samples(group, result, sample_count)
 
         # Post-measurement correctness verification
         for cfg in group.configs:
@@ -1389,30 +1496,58 @@ class BenchmarkRunner:
                     % (cfg.name, tainted, len(br.wall_times),
                        ', '.join(str(i) for i in br.throttled_sample_indices))
                 )
+            if br.clean_sample_count < sample_count:
+                eprint(
+                    '  WARNING: %s has only %d/%d clean samples after %d retry round(s)'
+                    % (
+                        cfg.name,
+                        br.clean_sample_count,
+                        sample_count,
+                        self.sample_retries,
+                    )
+                )
 
         # Report quick stats and outliers
-        n = len(group.configs[0].cmd)  # just for label width reference
         for cfg in group.configs:
             br = result.results[cfg.name]
             st = br.stats
             sample_n = int(st.get('n', len(br.wall_times)))
+            best_clean = br.best_clean_time
             flags = ''
             if br.is_unreliable:
                 flags += ' [UNRELIABLE: cv=%.1f%%]' % (st['cv'] * 100)
             if br.outlier_count > 0:
                 flags += ' [%d OUTLIER(S)]' % br.outlier_count
+            if br.clean_sample_count != sample_n:
+                flags += ' [CLEAN %d/%d]' % (br.clean_sample_count, sample_n)
             # Use min/max labels when n < 20
             if sample_n < 20:
                 eprint(
-                    '  %-30s median=%.4fs  min=%.4fs  max=%.4fs  CV=%.1f%%  cv_mad=%.1f%%%s'
-                    % (cfg.name, st['median'], st['p5'], st['p95'],
-                       st['cv'] * 100, st['cv_mad'] * 100, flags)
+                    '  %-30s median=%.4fs  best_clean=%s  min=%.4fs  max=%.4fs  CV=%.1f%%  cv_mad=%.1f%%%s'
+                    % (
+                        cfg.name,
+                        st['median'],
+                        '%.4fs' % best_clean if best_clean is not None else 'n/a',
+                        st['p5'],
+                        st['p95'],
+                        st['cv'] * 100,
+                        st['cv_mad'] * 100,
+                        flags,
+                    )
                 )
             else:
                 eprint(
-                    '  %-30s median=%.4fs  p5=%.4fs  p95=%.4fs  CV=%.1f%%  cv_mad=%.1f%%%s'
-                    % (cfg.name, st['median'], st['p5'], st['p95'],
-                       st['cv'] * 100, st['cv_mad'] * 100, flags)
+                    '  %-30s median=%.4fs  best_clean=%s  p5=%.4fs  p95=%.4fs  CV=%.1f%%  cv_mad=%.1f%%%s'
+                    % (
+                        cfg.name,
+                        st['median'],
+                        '%.4fs' % best_clean if best_clean is not None else 'n/a',
+                        st['p5'],
+                        st['p95'],
+                        st['cv'] * 100,
+                        st['cv_mad'] * 100,
+                        flags,
+                    )
                 )
 
         return result
@@ -1889,11 +2024,18 @@ def build_ab_group(
 
 
 def load_baseline(baseline_path: str) -> Dict[str, List[float]]:
-    """Load baseline CSV and return a mapping of suite/config -> wall times."""
+    """Load baseline CSV and return a mapping of suite/config -> wall times.
+
+    When the CSV includes clean-sample annotations from a newer arm_bench
+    run, only clean samples are loaded for comparison.
+    """
     results: Dict[str, List[float]] = {}
     with open(baseline_path, 'r') as f:
         reader = csv.DictReader(f)
         for row in reader:
+            clean_sample = row.get('clean_sample')
+            if clean_sample not in (None, '', '1', 'true', 'True', 'yes'):
+                continue
             benchmark = row.get('benchmark', '')
             name = row.get('name', '')
             cache_mode = row.get('cache_mode', '')
@@ -1932,7 +2074,7 @@ def check_regressions(
                     continue
 
                 entry, compare_warnings = compare_sample_sets(
-                    baseline_times, br.wall_times
+                    baseline_times, br.comparison_wall_times
                 )
                 if entry is None:
                     for warning in compare_warnings:
@@ -1991,8 +2133,8 @@ def compare_ab_suites(
                 reference = pair[compare_label]
                 candidate = pair[primary_label]
                 entry, compare_warnings = compare_sample_sets(
-                    reference.wall_times,
-                    candidate.wall_times,
+                    reference.comparison_wall_times,
+                    candidate.comparison_wall_times,
                 )
                 full_key = '%s/%s/%s' % (
                     suite.cache_mode, gr.group.name, logical_name,
@@ -2045,7 +2187,8 @@ def write_csv(
     Existing columns: benchmark, warmup_iter, iter, name, command, duration,
     lines, env.
     ARM-specific columns appended: chip, cores_used, thermal_state, cache_mode,
-    cv, median, p5, p95, user_time, sys_time, binary_label, logical_name.
+    cv, median, p5, p95, user_time, sys_time, binary_label, logical_name,
+    clean_sample, clean_n, best_clean.
     """
     fields = [
         'benchmark', 'warmup_iter', 'iter',
@@ -2054,6 +2197,7 @@ def write_csv(
         'chip', 'cores_used', 'thermal_state', 'cache_mode',
         'cv', 'median', 'p5', 'p95', 'user_time', 'sys_time',
         'cpu_freq_mhz', 'cv_mad', 'binary_label', 'logical_name',
+        'clean_sample', 'clean_n', 'best_clean',
     ]
 
     chip = system_info.get('chip', 'unknown')
@@ -2081,6 +2225,8 @@ def write_csv(
                 for cfg_name, br in gr.results.items():
                     cfg = br.config
                     stats = br.stats
+                    clean_indices = set(br.clean_sample_indices)
+                    best_clean = br.best_clean_time
                     for i, wt in enumerate(br.wall_times):
                         thermal = br.thermal_states[i] if i < len(br.thermal_states) else ''
                         cpu_freq_str = ''
@@ -2112,6 +2258,9 @@ def write_csv(
                             'cv_mad': '%.4f' % stats['cv_mad'],
                             'binary_label': cfg.variant_label or '',
                             'logical_name': cfg.logical_name,
+                            'clean_sample': '1' if i in clean_indices else '0',
+                            'clean_n': br.clean_sample_count,
+                            'best_clean': '%.6f' % best_clean if best_clean is not None else '',
                         })
 
 
@@ -2129,7 +2278,7 @@ def write_json(
             'system': system_info,
             **run_metadata,
             'timestamp': datetime.datetime.now().isoformat(),
-            'arm_bench_version': '1.1.0',
+            'arm_bench_version': '1.2.0',
         },
         'suites': {},
         'regressions': regressions,
@@ -2168,12 +2317,17 @@ def write_json(
                     'logical_name': br.config.logical_name,
                     'variant_label': br.config.variant_label,
                     'wall_times': br.wall_times,
+                    'clean_wall_times': br.clean_wall_times,
                     'user_times': br.user_times,
                     'sys_times': br.sys_times,
                     'line_counts': br.line_counts,
                     'thermal_states': br.thermal_states,
                     'cpu_frequencies': br.cpu_frequencies,
                     'stats': stats_dict,
+                    'clean_stats': br.clean_stats,
+                    'clean_sample_indices': br.clean_sample_indices,
+                    'clean_sample_count': br.clean_sample_count,
+                    'best_clean': br.best_clean_time,
                     'unreliable': br.is_unreliable,
                     'cv_threshold': br.cv_threshold,
                     'outlier_indices': br.outlier_indices,
@@ -2222,6 +2376,10 @@ def format_summary(
     lines.append('  Memory:        %.1f GB' % system_info.get('memory_gb', 0))
     lines.append('  Rust:          %s' % system_info.get('rust_version', 'unknown'))
     lines.append('  Build profile: %s' % run_metadata.get('primary_profile', 'unknown'))
+    lines.append(
+        '  Sample retries:%3s'
+        % run_metadata.get('sample_retries', DEFAULT_SAMPLE_RETRIES)
+    )
     lines.append(
         '  Cache mode%s:  %s'
         % (
@@ -2294,6 +2452,7 @@ def format_summary(
                     continue
                 st = br.stats
                 sample_n = int(st.get('n', len(br.wall_times)))
+                best_clean = br.best_clean_time
                 lc = br.line_counts[0] if br.line_counts else None
                 lc_str = ' (lines: %s)' % lc if lc is not None else ''
                 fast_marker = '*' if cfg_name == fastest_name else ' '
@@ -2310,17 +2469,30 @@ def format_summary(
                     flags += ' [%d/%d THERMALLY TAINTED]' % (
                         br.thermal_tainted_count, len(br.wall_times),
                     )
+                if br.clean_sample_count != sample_n:
+                    flags += ' [CLEAN %d/%d]' % (br.clean_sample_count, sample_n)
 
                 if sample_n < 20:
                     range_label = ('min', 'max')
                 else:
                     range_label = ('p5', 'p95')
                 lines.append(
-                    '  %s %-*s  median=%.4fs  %s=%.4fs  %s=%.4fs  CV=%.1f%%  cv_mad=%.1f%%%s%s'
-                    % (fast_marker, max_name_len + 2, cfg_name,
-                       st['median'], range_label[0], st['p5'],
-                       range_label[1], st['p95'],
-                       st['cv'] * 100, st['cv_mad'] * 100, lc_str, flags)
+                    '  %s %-*s  median=%.4fs  best_clean=%s  %s=%.4fs  %s=%.4fs  CV=%.1f%%  cv_mad=%.1f%%%s%s'
+                    % (
+                        fast_marker,
+                        max_name_len + 2,
+                        cfg_name,
+                        st['median'],
+                        '%.4fs' % best_clean if best_clean is not None else 'n/a',
+                        range_label[0],
+                        st['p5'],
+                        range_label[1],
+                        st['p95'],
+                        st['cv'] * 100,
+                        st['cv_mad'] * 100,
+                        lc_str,
+                        flags,
+                    )
                 )
             lines.append('')
 
@@ -2443,6 +2615,15 @@ def collect_suite_warnings(
                             len(br.wall_times),
                         )
                     )
+                if br.clean_sample_count < MIN_COMPARISON_SAMPLES:
+                    warnings.append(
+                        'Clean samples: %s has only %d clean sample(s); '
+                        'comparisons may fall back to raw timings'
+                        % (
+                            benchmark_key,
+                            br.clean_sample_count,
+                        )
+                    )
     return unreliable, warnings
 
 
@@ -2549,9 +2730,21 @@ Examples:
              'warmup times must be within this fraction of the faster time.',
     )
     p.add_argument(
+        '--sample-retries', type=int, default=DEFAULT_SAMPLE_RETRIES,
+        help='Extra replacement-sample rounds used to recover clean samples '
+             'after thermal taint or outliers (default: %d).'
+             % DEFAULT_SAMPLE_RETRIES,
+    )
+    p.add_argument(
+        '--allow-dirty-env', action='store_true', default=False,
+        help='Allow benchmarking to continue when Spotlight, Time Machine, '
+             'swap pressure, or elevated baseline thermal state are detected. '
+             'By default these conditions stop the run.',
+    )
+    p.add_argument(
         '--seed', type=int, default=None,
         help='Random seed for reproducible benchmark ordering. '
-             'If not provided, a seed is generated and recorded in output.',
+            'If not provided, a seed is generated and recorded in output.',
     )
 
     args = p.parse_args()
@@ -2560,6 +2753,9 @@ Examples:
     if args.samples is not None and args.samples < 5:
         eprint('WARNING: --samples %d is below the CLAUDE.md minimum of 5. '
                'Results may not be statistically meaningful.' % args.samples)
+    if args.sample_retries < 0:
+        eprint('ERROR: --sample-retries must be >= 0.')
+        return 1
 
     cache_modes = parse_cache_modes(args.cache)
     if args.compare_bin and args.baseline:
@@ -2606,11 +2802,6 @@ Examples:
         system_info.get('chip', 'unknown'),
         system_info.get('arch', 'unknown'),
     ))
-
-    # Check for background interference
-    bg_warnings = check_background_interference()
-    for bw in bg_warnings:
-        eprint('WARNING: %s' % bw)
 
     # Determine project root (assume arm_bench.py is in benchsuite/)
     script_dir = path.dirname(path.abspath(__file__))
@@ -2686,6 +2877,19 @@ Examples:
         eprint('Run: benchsuite/benchsuite --dir %s --download all' % suite_dir)
         return 1
 
+    # Check for background interference on the benchmark corpus location.
+    bg_warnings = check_background_interference(suite_dir)
+    if bg_warnings and not args.allow_dirty_env:
+        eprint(
+            'ERROR: Dirty benchmark environment detected. '
+            'Fix the issues below or rerun with --allow-dirty-env.'
+        )
+        for bw in bg_warnings:
+            eprint('  - %s' % bw)
+        return 1
+    for bw in bg_warnings:
+        eprint('WARNING: %s' % bw)
+
     # Determine scenarios to run
     if args.scenarios:
         scenario_names = [s.strip() for s in args.scenarios.split(',')]
@@ -2710,6 +2914,20 @@ Examples:
     thermal = ThermalMonitor(use_sudo=args.sudo)
     baseline_thermal = thermal.capture_baseline()
     eprint('Thermal state: %s' % baseline_thermal)
+    if baseline_thermal not in ('nominal', 'unknown'):
+        msg = (
+            'Baseline thermal state is %s. Start benchmarks from a cool, '
+            'nominal machine for comparable results.' % baseline_thermal
+        )
+        if args.allow_dirty_env:
+            eprint('WARNING: %s' % msg)
+            warnings.append(msg)
+        else:
+            eprint(
+                'ERROR: %s Rerun after cooldown or use --allow-dirty-env.'
+                % msg
+            )
+            return 1
 
     if not args.sudo:
         eprint(
@@ -2760,6 +2978,7 @@ Examples:
             cache_mode=cache_mode,
             use_sudo=args.sudo,
             convergence_threshold=args.convergence_threshold,
+            sample_retries=args.sample_retries,
         )
 
         group_results: List[GroupResult] = []
@@ -2802,6 +3021,8 @@ Examples:
         'primary_version': rg_version,
         'primary_profile': primary_profile,
         'cache_modes': cache_modes,
+        'sample_retries': args.sample_retries,
+        'allow_dirty_env': args.allow_dirty_env,
     }
     if compare_bin is not None:
         run_metadata.update({

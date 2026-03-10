@@ -13,6 +13,7 @@ Canonical standards are defined in CLAUDE.md section "ARM Benchmark Standards".
 Usage:
     ./arm_bench.py --dir /tmp/benchsuite
     ./arm_bench.py --dir /tmp/benchsuite --baseline runs/arm-m5-baseline/raw.csv
+    ./arm_bench.py --dir /tmp/benchsuite --compare-bin /tmp/rg-upstream --cache both
     ./arm_bench.py --dir /tmp/benchsuite --scenarios thread_scaling,mmap_vs_read
     ./arm_bench.py --help
 """
@@ -638,6 +639,15 @@ def get_rg_version(rg_bin: str) -> str:
         return 'unknown'
 
 
+def detect_binary_profile(rg_bin: str) -> str:
+    """Best-effort detection of the Cargo profile used for a binary path."""
+    if 'release-lto' in rg_bin:
+        return 'release-lto'
+    if 'release' in rg_bin:
+        return 'release'
+    return 'custom'
+
+
 # ---------------------------------------------------------------------------
 # Timing and execution
 # ---------------------------------------------------------------------------
@@ -928,6 +938,78 @@ def _normal_cdf(z: float) -> float:
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 
+def compare_sample_sets(
+    reference_times: List[float],
+    candidate_times: List[float],
+) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    """Compare two sample sets using medians and Mann-Whitney U.
+
+    The candidate is interpreted relative to the reference:
+    pct_change = (candidate_median - reference_median) / reference_median.
+    Positive percentages therefore mean the candidate is slower.
+    """
+    warnings: List[str] = []
+    if len(reference_times) < 5 or len(candidate_times) < 5:
+        warnings.append(
+            'need >= 5 samples (reference=%d, candidate=%d)'
+            % (len(reference_times), len(candidate_times))
+        )
+        return None, warnings
+
+    if len(reference_times) < 8 or len(candidate_times) < 8:
+        warnings.append(
+            'normal approximation may be inaccurate with n < 8 '
+            '(reference=%d, candidate=%d)'
+            % (len(reference_times), len(candidate_times))
+        )
+
+    reference_median = statistics.median(reference_times)
+    candidate_median = statistics.median(candidate_times)
+    if reference_median == 0:
+        warnings.append('reference median is 0; skipping percent-change comparison')
+        return None, warnings
+
+    pct_change = (candidate_median - reference_median) / reference_median
+    _, p_value = mann_whitney_u(reference_times, candidate_times)
+    is_significant = p_value < REGRESSION_P_VALUE
+    is_regression = pct_change > REGRESSION_THRESHOLD and is_significant
+    is_improvement = pct_change < -REGRESSION_THRESHOLD and is_significant
+
+    n1 = len(reference_times)
+    n2 = len(candidate_times)
+    reference_mean = statistics.mean(reference_times)
+    candidate_mean = statistics.mean(candidate_times)
+    reference_sd = statistics.stdev(reference_times) if n1 > 1 else 0.0
+    candidate_sd = statistics.stdev(candidate_times) if n2 > 1 else 0.0
+    pooled_sd = math.sqrt(
+        ((n1 - 1) * reference_sd ** 2 + (n2 - 1) * candidate_sd ** 2)
+        / max(n1 + n2 - 2, 1)
+    ) if (reference_sd > 0 or candidate_sd > 0) else 0.0
+    if pooled_sd > 0:
+        effect_size = abs(candidate_mean - reference_mean) / pooled_sd
+        harmonic_n = 2.0 * n1 * n2 / (n1 + n2)
+        z_alpha = 1.96  # two-tailed alpha = 0.05
+        noncentrality = effect_size * math.sqrt(harmonic_n / 2.0)
+        power = _normal_cdf(noncentrality - z_alpha)
+    else:
+        effect_size = 0.0
+        power = 0.0
+
+    return {
+        'reference_median': reference_median,
+        'candidate_median': candidate_median,
+        'pct_change': pct_change,
+        'p_value': p_value,
+        'is_significant': is_significant,
+        'is_regression': is_regression,
+        'is_improvement': is_improvement,
+        'effect_size': effect_size,
+        'power': power,
+        'n_reference': n1,
+        'n_candidate': n2,
+    }, warnings
+
+
 # ---------------------------------------------------------------------------
 # Benchmark scenario definitions
 # ---------------------------------------------------------------------------
@@ -944,6 +1026,8 @@ class BenchmarkConfig:
         samples: int = DEFAULT_SAMPLES,
         warmups: int = DEFAULT_WARMUPS,
         cv_threshold: Optional[float] = None,
+        logical_name: Optional[str] = None,
+        variant_label: Optional[str] = None,
     ) -> None:
         self.name = name
         self.cmd = cmd
@@ -951,6 +1035,8 @@ class BenchmarkConfig:
         self.samples = samples
         self.warmups = warmups
         self.cv_threshold = cv_threshold  # None means use group/global default
+        self.logical_name = name if logical_name is None else logical_name
+        self.variant_label = variant_label
 
 
 class BenchmarkGroup:
@@ -1046,6 +1132,20 @@ class GroupResult:
     def has_unreliable(self) -> bool:
         """Return True if any config result is unreliable."""
         return any(r.is_unreliable for r in self.results.values())
+
+
+class SuiteResult:
+    """Results for one cache-mode suite."""
+
+    def __init__(
+        self,
+        cache_mode: str,
+        group_results: List[GroupResult],
+        comparisons: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        self.cache_mode = cache_mode
+        self.group_results = group_results
+        self.comparisons = [] if comparisons is None else comparisons
 
 
 # ---------------------------------------------------------------------------
@@ -1680,24 +1780,127 @@ ALL_SCENARIOS = {
 }
 
 
+def parse_cache_modes(cache_arg: str) -> List[str]:
+    """Expand a CLI cache selector into concrete suite modes."""
+    if cache_arg == 'both':
+        return ['warm', 'cold']
+    return [cache_arg]
+
+
+def apply_samples_override(
+    group: BenchmarkGroup,
+    scenario_name: str,
+    sample_override: Optional[int],
+) -> None:
+    """Apply a global sample-count override with scenario-specific floors."""
+    if sample_override is None:
+        return
+    for cfg in group.configs:
+        if scenario_name in ('thread_scaling', 'thread_scaling_output'):
+            cfg.samples = max(sample_override, THREAD_SCALING_SAMPLES)
+        else:
+            cfg.samples = sample_override
+
+
+def build_scenario_group(
+    scenario_name: str,
+    rg_bin: str,
+    suite_dir: str,
+    system_info: Dict[str, Any],
+    sample_override: Optional[int],
+) -> BenchmarkGroup:
+    """Build one benchmark group with sample overrides applied."""
+    group = ALL_SCENARIOS[scenario_name](rg_bin, suite_dir, system_info)
+    apply_samples_override(group, scenario_name, sample_override)
+    return group
+
+
+def labeled_config(cfg: BenchmarkConfig, label: str) -> BenchmarkConfig:
+    """Clone a config with an A/B variant label for interleaved comparison."""
+    return BenchmarkConfig(
+        name='[%s] %s' % (label, cfg.logical_name),
+        cmd=list(cfg.cmd),
+        cwd=cfg.cwd,
+        samples=cfg.samples,
+        warmups=cfg.warmups,
+        cv_threshold=cfg.cv_threshold,
+        logical_name=cfg.logical_name,
+        variant_label=label,
+    )
+
+
+def build_ab_group(
+    scenario_name: str,
+    primary_bin: str,
+    compare_bin: str,
+    suite_dir: str,
+    system_info: Dict[str, Any],
+    sample_override: Optional[int],
+    primary_label: str,
+    compare_label: str,
+) -> BenchmarkGroup:
+    """Build one interleaved A/B benchmark group for two binaries."""
+    primary = build_scenario_group(
+        scenario_name, primary_bin, suite_dir, system_info, sample_override
+    )
+    compare = build_scenario_group(
+        scenario_name, compare_bin, suite_dir, system_info, sample_override
+    )
+    if primary.name != compare.name:
+        raise RuntimeError(
+            'Scenario %s produced mismatched group names: %s vs %s'
+            % (scenario_name, primary.name, compare.name)
+        )
+
+    compare_by_name = {
+        cfg.logical_name: cfg for cfg in compare.configs
+    }
+    configs: List[BenchmarkConfig] = []
+    missing: List[str] = []
+    for primary_cfg in primary.configs:
+        compare_cfg = compare_by_name.pop(primary_cfg.logical_name, None)
+        if compare_cfg is None:
+            missing.append(primary_cfg.logical_name)
+            continue
+        configs.append(labeled_config(primary_cfg, primary_label))
+        configs.append(labeled_config(compare_cfg, compare_label))
+    if missing or compare_by_name:
+        missing_list = missing + sorted(compare_by_name.keys())
+        raise RuntimeError(
+            'Scenario %s produced mismatched config sets: %s'
+            % (scenario_name, ', '.join(missing_list))
+        )
+
+    return BenchmarkGroup(
+        name=primary.name,
+        description=(
+            '%s (interleaved %s vs %s)'
+            % (primary.description, primary_label, compare_label)
+        ),
+        configs=configs,
+        interleaved=True,
+        cv_threshold=primary.cv_threshold,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Regression detection
 # ---------------------------------------------------------------------------
 
 
 def load_baseline(baseline_path: str) -> Dict[str, List[float]]:
-    """Load baseline CSV and return a mapping of benchmark_config_name -> wall_times.
-
-    Expects CSV with columns: benchmark, warmup_iter, iter, name, command,
-    duration, lines, env, [arm-specific columns...].
-    The 'name' column is used as the config identifier, and 'duration' as
-    the wall time sample.
-    """
+    """Load baseline CSV and return a mapping of suite/config -> wall times."""
     results: Dict[str, List[float]] = {}
     with open(baseline_path, 'r') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            key = '%s/%s' % (row.get('benchmark', ''), row.get('name', ''))
+            benchmark = row.get('benchmark', '')
+            name = row.get('name', '')
+            cache_mode = row.get('cache_mode', '')
+            if cache_mode:
+                key = '%s/%s/%s' % (cache_mode, benchmark, name)
+            else:
+                key = '%s/%s' % (benchmark, name)
             duration = float(row.get('duration', 0))
             if key not in results:
                 results[key] = []
@@ -1706,14 +1909,10 @@ def load_baseline(baseline_path: str) -> Dict[str, List[float]]:
 
 
 def check_regressions(
-    group_results: List[GroupResult],
+    suite_results: Sequence[SuiteResult],
     baseline: Dict[str, List[float]],
 ) -> List[Dict[str, Any]]:
-    """Compare benchmark results against baseline and flag regressions.
-
-    A regression is flagged when the new median is >5% slower
-    with p < 0.05 on a Mann-Whitney U test.
-    """
+    """Compare benchmark results against a prior CSV baseline."""
     eprint(
         'WARNING: Baseline comparison is NOT interleaved A/B. '
         'Results may be confounded by environmental differences '
@@ -1721,81 +1920,114 @@ def check_regressions(
     )
     regressions: List[Dict[str, Any]] = []
 
-    for gr in group_results:
-        for cfg_name, br in gr.results.items():
-            key = '%s/%s' % (gr.group.name, cfg_name)
-            if key not in baseline:
-                continue
-            baseline_times = baseline[key]
-            new_times = br.wall_times
+    for suite in suite_results:
+        for gr in suite.group_results:
+            for cfg_name, br in gr.results.items():
+                full_key = '%s/%s/%s' % (suite.cache_mode, gr.group.name, cfg_name)
+                legacy_key = '%s/%s' % (gr.group.name, cfg_name)
+                baseline_times = baseline.get(full_key)
+                if baseline_times is None:
+                    baseline_times = baseline.get(legacy_key)
+                if baseline_times is None:
+                    continue
 
-            if len(baseline_times) < 5 or len(new_times) < 5:
-                eprint(
-                    'WARNING: Skipping regression check for %s: '
-                    'need >= 5 samples (baseline=%d, new=%d)'
-                    % (key, len(baseline_times), len(new_times))
+                entry, compare_warnings = compare_sample_sets(
+                    baseline_times, br.wall_times
                 )
-                continue
+                if entry is None:
+                    for warning in compare_warnings:
+                        eprint(
+                            'WARNING: Skipping regression check for %s: %s'
+                            % (full_key, warning)
+                        )
+                    continue
+                for warning in compare_warnings:
+                    eprint('WARNING: %s: %s' % (full_key, warning))
 
-            if len(baseline_times) < 8 or len(new_times) < 8:
-                eprint(
-                    'WARNING: %s: normal approximation may be inaccurate '
-                    'with n < 8 (baseline=%d, new=%d)'
-                    % (key, len(baseline_times), len(new_times))
-                )
-
-            baseline_median = statistics.median(baseline_times)
-            new_median = statistics.median(new_times)
-
-            if baseline_median == 0:
-                continue
-
-            pct_change = (new_median - baseline_median) / baseline_median
-            _, p_value = mann_whitney_u(baseline_times, new_times)
-
-            is_regression = (
-                pct_change > REGRESSION_THRESHOLD
-                and p_value < REGRESSION_P_VALUE
-            )
-
-            # Compute approximate statistical power
-            # power ~ Phi(|d| * sqrt(n/2) - z_alpha)
-            # where d = Cohen's d = |mean_diff| / pooled_sd
-            n1 = len(baseline_times)
-            n2 = len(new_times)
-            baseline_mean = statistics.mean(baseline_times)
-            new_mean = statistics.mean(new_times)
-            baseline_sd = statistics.stdev(baseline_times) if n1 > 1 else 0.0
-            new_sd = statistics.stdev(new_times) if n2 > 1 else 0.0
-            pooled_sd = math.sqrt(
-                ((n1 - 1) * baseline_sd ** 2 + (n2 - 1) * new_sd ** 2)
-                / max(n1 + n2 - 2, 1)
-            ) if (baseline_sd > 0 or new_sd > 0) else 0.0
-            if pooled_sd > 0:
-                effect_size = abs(new_mean - baseline_mean) / pooled_sd
-                harmonic_n = 2.0 * n1 * n2 / (n1 + n2)
-                z_alpha = 1.96  # two-tailed alpha = 0.05
-                noncentrality = effect_size * math.sqrt(harmonic_n / 2.0)
-                power = _normal_cdf(noncentrality - z_alpha)
-            else:
-                effect_size = 0.0
-                power = 0.0
-
-            entry = {
-                'benchmark': key,
-                'baseline_median': baseline_median,
-                'new_median': new_median,
-                'pct_change': pct_change,
-                'p_value': p_value,
-                'is_regression': is_regression,
-                'effect_size': effect_size,
-                'power': power,
-                'n_baseline': n1,
-                'n_new': n2,
-            }
-            regressions.append(entry)
+                regressions.append({
+                    'benchmark': full_key,
+                    'cache_mode': suite.cache_mode,
+                    'baseline_median': entry['reference_median'],
+                    'new_median': entry['candidate_median'],
+                    'pct_change': entry['pct_change'],
+                    'p_value': entry['p_value'],
+                    'is_significant': entry['is_significant'],
+                    'is_regression': entry['is_regression'],
+                    'effect_size': entry['effect_size'],
+                    'power': entry['power'],
+                    'n_baseline': entry['n_reference'],
+                    'n_new': entry['n_candidate'],
+                })
 
     return regressions
+
+
+def compare_ab_suites(
+    suite_results: Sequence[SuiteResult],
+    primary_label: str,
+    compare_label: str,
+) -> List[str]:
+    """Populate suite comparisons for interleaved A/B binary runs."""
+    warnings: List[str] = []
+    for suite in suite_results:
+        comparisons: List[Dict[str, Any]] = []
+        for gr in suite.group_results:
+            pairings: Dict[str, Dict[str, BenchmarkResult]] = {}
+            logical_order: List[str] = []
+            for cfg in gr.group.configs:
+                logical_name = cfg.logical_name
+                if logical_name not in pairings:
+                    pairings[logical_name] = {}
+                    logical_order.append(logical_name)
+                pairings[logical_name][cfg.variant_label or ''] = gr.results[cfg.name]
+            for logical_name in logical_order:
+                pair = pairings[logical_name]
+                if primary_label not in pair or compare_label not in pair:
+                    warnings.append(
+                        'A/B pair missing for %s/%s in %s cache'
+                        % (gr.group.name, logical_name, suite.cache_mode)
+                    )
+                    continue
+                reference = pair[compare_label]
+                candidate = pair[primary_label]
+                entry, compare_warnings = compare_sample_sets(
+                    reference.wall_times,
+                    candidate.wall_times,
+                )
+                full_key = '%s/%s/%s' % (
+                    suite.cache_mode, gr.group.name, logical_name,
+                )
+                if entry is None:
+                    for warning in compare_warnings:
+                        warnings.append(
+                            'A/B compare skipped for %s: %s' % (full_key, warning)
+                        )
+                    continue
+                for warning in compare_warnings:
+                    warnings.append('A/B compare note for %s: %s' % (full_key, warning))
+                comparisons.append({
+                    'benchmark': full_key,
+                    'group': gr.group.name,
+                    'config': logical_name,
+                    'cache_mode': suite.cache_mode,
+                    'reference_label': compare_label,
+                    'candidate_label': primary_label,
+                    'reference_name': reference.config.name,
+                    'candidate_name': candidate.config.name,
+                    'reference_median': entry['reference_median'],
+                    'candidate_median': entry['candidate_median'],
+                    'pct_change': entry['pct_change'],
+                    'p_value': entry['p_value'],
+                    'is_significant': entry['is_significant'],
+                    'is_regression': entry['is_regression'],
+                    'is_improvement': entry['is_improvement'],
+                    'effect_size': entry['effect_size'],
+                    'power': entry['power'],
+                    'n_reference': entry['n_reference'],
+                    'n_candidate': entry['n_candidate'],
+                })
+        suite.comparisons = comparisons
+    return warnings
 
 
 # ---------------------------------------------------------------------------
@@ -1805,16 +2037,15 @@ def check_regressions(
 
 def write_csv(
     filepath: str,
-    group_results: List[GroupResult],
+    suite_results: Sequence[SuiteResult],
     system_info: Dict[str, Any],
-    cache_mode: str,
 ) -> None:
-    """Write benchmark results to CSV in a format compatible with existing raw.csv.
+    """Write benchmark results to CSV in a format compatible with raw.csv.
 
     Existing columns: benchmark, warmup_iter, iter, name, command, duration,
     lines, env.
     ARM-specific columns appended: chip, cores_used, thermal_state, cache_mode,
-    cv, median, p5, p95, user_time, sys_time.
+    cv, median, p5, p95, user_time, sys_time, binary_label, logical_name.
     """
     fields = [
         'benchmark', 'warmup_iter', 'iter',
@@ -1822,7 +2053,7 @@ def write_csv(
         # ARM-specific columns appended after existing columns
         'chip', 'cores_used', 'thermal_state', 'cache_mode',
         'cv', 'median', 'p5', 'p95', 'user_time', 'sys_time',
-        'cpu_freq_mhz', 'cv_mad',
+        'cpu_freq_mhz', 'cv_mad', 'binary_label', 'logical_name',
     ]
 
     chip = system_info.get('chip', 'unknown')
@@ -1845,118 +2076,134 @@ def write_csv(
         writer = csv.DictWriter(f, fields)
         writer.writeheader()
 
-        for gr in group_results:
-            for cfg_name, br in gr.results.items():
-                cfg = br.config
-                stats = br.stats
-                for i, wt in enumerate(br.wall_times):
-                    thermal = br.thermal_states[i] if i < len(br.thermal_states) else ''
-                    # Format CPU frequency for this sample
-                    cpu_freq_str = ''
-                    if i < len(br.cpu_frequencies) and br.cpu_frequencies[i]:
-                        freq = br.cpu_frequencies[i]
-                        cpu_freq_str = ';'.join(
-                            '%s=%d' % (k, v) for k, v in sorted(freq.items())
-                        )
-                    writer.writerow({
-                        'benchmark': gr.group.name,
-                        'warmup_iter': cfg.warmups,
-                        'iter': i,
-                        'name': cfg.name,
-                        'command': ' '.join(cfg.cmd),
-                        'duration': wt,
-                        'lines': br.line_counts[0] if br.line_counts else '',
-                        'env': '',
-                        'chip': chip,
-                        'cores_used': cores_used,
-                        'thermal_state': thermal,
-                        'cache_mode': cache_mode,
-                        'cv': '%.4f' % stats['cv'],
-                        'median': '%.6f' % stats['median'],
-                        'p5': '%.6f' % stats['p5'],
-                        'p95': '%.6f' % stats['p95'],
-                        'user_time': '%.6f' % br.user_times[i] if i < len(br.user_times) else '',
-                        'sys_time': '%.6f' % br.sys_times[i] if i < len(br.sys_times) else '',
-                        'cpu_freq_mhz': cpu_freq_str,
-                        'cv_mad': '%.4f' % stats['cv_mad'],
-                    })
+        for suite in suite_results:
+            for gr in suite.group_results:
+                for cfg_name, br in gr.results.items():
+                    cfg = br.config
+                    stats = br.stats
+                    for i, wt in enumerate(br.wall_times):
+                        thermal = br.thermal_states[i] if i < len(br.thermal_states) else ''
+                        cpu_freq_str = ''
+                        if i < len(br.cpu_frequencies) and br.cpu_frequencies[i]:
+                            freq = br.cpu_frequencies[i]
+                            cpu_freq_str = ';'.join(
+                                '%s=%d' % (k, v) for k, v in sorted(freq.items())
+                            )
+                        writer.writerow({
+                            'benchmark': gr.group.name,
+                            'warmup_iter': cfg.warmups,
+                            'iter': i,
+                            'name': cfg.name,
+                            'command': ' '.join(cfg.cmd),
+                            'duration': wt,
+                            'lines': br.line_counts[0] if br.line_counts else '',
+                            'env': '',
+                            'chip': chip,
+                            'cores_used': cores_used,
+                            'thermal_state': thermal,
+                            'cache_mode': suite.cache_mode,
+                            'cv': '%.4f' % stats['cv'],
+                            'median': '%.6f' % stats['median'],
+                            'p5': '%.6f' % stats['p5'],
+                            'p95': '%.6f' % stats['p95'],
+                            'user_time': '%.6f' % br.user_times[i] if i < len(br.user_times) else '',
+                            'sys_time': '%.6f' % br.sys_times[i] if i < len(br.sys_times) else '',
+                            'cpu_freq_mhz': cpu_freq_str,
+                            'cv_mad': '%.4f' % stats['cv_mad'],
+                            'binary_label': cfg.variant_label or '',
+                            'logical_name': cfg.logical_name,
+                        })
 
 
 def write_json(
     filepath: str,
-    group_results: List[GroupResult],
+    suite_results: Sequence[SuiteResult],
     system_info: Dict[str, Any],
     regressions: List[Dict[str, Any]],
     warnings: List[str],
-    build_profile: str,
-    cache_mode: str,
+    run_metadata: Dict[str, Any],
 ) -> None:
     """Write detailed JSON output with all metadata and results."""
     output: Dict[str, Any] = {
         'metadata': {
             'system': system_info,
-            'build_profile': build_profile,
-            'cache_mode': cache_mode,
+            **run_metadata,
             'timestamp': datetime.datetime.now().isoformat(),
-            'arm_bench_version': '1.0.0',
+            'arm_bench_version': '1.1.0',
         },
-        'benchmarks': {},
+        'suites': {},
         'regressions': regressions,
         'warnings': warnings,
     }
 
-    for gr in group_results:
-        group_data: Dict[str, Any] = {
-            'description': gr.group.description,
-            'configs': {},
+    all_comparisons: List[Dict[str, Any]] = []
+    for suite in suite_results:
+        suite_benchmarks: Dict[str, Any] = {}
+        for gr in suite.group_results:
+            group_data: Dict[str, Any] = {
+                'description': gr.group.description,
+                'configs': {},
+            }
+            for cfg_name, br in gr.results.items():
+                stats = br.stats
+                sample_n = int(stats.get('n', len(br.wall_times)))
+                stats_dict: Dict[str, Any] = {
+                    'median': stats['median'],
+                    'p5': stats['p5'],
+                    'p95': stats['p95'],
+                    'mean': stats['mean'],
+                    'stdev': stats['stdev'],
+                    'cv': stats['cv'],
+                    'mad': stats['mad'],
+                    'cv_mad': stats['cv_mad'],
+                    'n': sample_n,
+                }
+                if sample_n < 20:
+                    stats_dict['note'] = (
+                        'p5 and p95 equal min and max respectively '
+                        'due to sample size n=%d < 20' % sample_n
+                    )
+                config_data: Dict[str, Any] = {
+                    'command': ' '.join(br.config.cmd),
+                    'logical_name': br.config.logical_name,
+                    'variant_label': br.config.variant_label,
+                    'wall_times': br.wall_times,
+                    'user_times': br.user_times,
+                    'sys_times': br.sys_times,
+                    'line_counts': br.line_counts,
+                    'thermal_states': br.thermal_states,
+                    'cpu_frequencies': br.cpu_frequencies,
+                    'stats': stats_dict,
+                    'unreliable': br.is_unreliable,
+                    'cv_threshold': br.cv_threshold,
+                    'outlier_indices': br.outlier_indices,
+                    'outlier_count': br.outlier_count,
+                }
+                group_data['configs'][cfg_name] = config_data
+            suite_benchmarks[gr.group.name] = group_data
+        output['suites'][suite.cache_mode] = {
+            'benchmarks': suite_benchmarks,
+            'comparisons': suite.comparisons,
         }
-        for cfg_name, br in gr.results.items():
-            stats = br.stats
-            sample_n = int(stats.get('n', len(br.wall_times)))
-            stats_dict: Dict[str, Any] = {
-                'median': stats['median'],
-                'p5': stats['p5'],
-                'p95': stats['p95'],
-                'mean': stats['mean'],
-                'stdev': stats['stdev'],
-                'cv': stats['cv'],
-                'mad': stats['mad'],
-                'cv_mad': stats['cv_mad'],
-                'n': sample_n,
-            }
-            if sample_n < 20:
-                stats_dict['note'] = (
-                    'p5 and p95 equal min and max respectively '
-                    'due to sample size n=%d < 20' % sample_n
-                )
-            config_data: Dict[str, Any] = {
-                'command': ' '.join(br.config.cmd),
-                'wall_times': br.wall_times,
-                'user_times': br.user_times,
-                'sys_times': br.sys_times,
-                'line_counts': br.line_counts,
-                'thermal_states': br.thermal_states,
-                'cpu_frequencies': br.cpu_frequencies,
-                'stats': stats_dict,
-                'unreliable': br.is_unreliable,
-                'cv_threshold': br.cv_threshold,
-                'outlier_indices': br.outlier_indices,
-                'outlier_count': br.outlier_count,
-            }
-            group_data['configs'][cfg_name] = config_data
-        output['benchmarks'][gr.group.name] = group_data
+        all_comparisons.extend(suite.comparisons)
+
+    if len(suite_results) == 1:
+        only_suite = next(iter(suite_results))
+        output['benchmarks'] = output['suites'][only_suite.cache_mode]['benchmarks']
+        output['comparisons'] = only_suite.comparisons
+    elif all_comparisons:
+        output['comparisons'] = all_comparisons
 
     with open(filepath, 'w') as f:
         json.dump(output, f, indent=2, default=str)
 
 
 def format_summary(
-    group_results: List[GroupResult],
+    suite_results: Sequence[SuiteResult],
     system_info: Dict[str, Any],
     regressions: List[Dict[str, Any]],
     warnings: List[str],
-    build_profile: str,
-    cache_mode: str,
+    run_metadata: Dict[str, Any],
 ) -> str:
     """Format a human-readable summary of benchmark results."""
     lines: List[str] = []
@@ -1974,8 +2221,32 @@ def format_summary(
     lines.append('  macOS:         %s' % system_info.get('os_version', 'unknown'))
     lines.append('  Memory:        %.1f GB' % system_info.get('memory_gb', 0))
     lines.append('  Rust:          %s' % system_info.get('rust_version', 'unknown'))
-    lines.append('  Build profile: %s' % build_profile)
-    lines.append('  Cache mode:    %s' % cache_mode)
+    lines.append('  Build profile: %s' % run_metadata.get('primary_profile', 'unknown'))
+    lines.append(
+        '  Cache mode%s:  %s'
+        % (
+            's' if len(run_metadata.get('cache_modes', [])) != 1 else '',
+            ', '.join(run_metadata.get('cache_modes', [])),
+        )
+    )
+    lines.append('  ripgrep:       %s' % run_metadata.get('primary_version', 'unknown'))
+    lines.append('  Binary:        %s' % run_metadata.get('primary_binary', 'unknown'))
+    if run_metadata.get('compare_binary'):
+        lines.append(
+            '  Compare (%s): %s'
+            % (
+                run_metadata.get('compare_label', 'compare'),
+                run_metadata.get('compare_binary', 'unknown'),
+            )
+        )
+        lines.append(
+            '  Compare ver.:  %s'
+            % run_metadata.get('compare_version', 'unknown')
+        )
+        lines.append(
+            '  Compare prof.: %s'
+            % run_metadata.get('compare_profile', 'unknown')
+        )
     lines.append('  Timestamp:     %s' % system_info.get('timestamp', ''))
     if 'core_topology' in system_info:
         topo = system_info['core_topology']
@@ -1995,60 +2266,93 @@ def format_summary(
     lines.append('')
 
     # Benchmark results
-    for gr in group_results:
-        header = '%s' % gr.group.name
-        lines.append(header)
-        lines.append('-' * len(header))
-        lines.append('  %s' % gr.group.description)
-        lines.append('')
+    for suite in suite_results:
+        if len(run_metadata.get('cache_modes', [])) > 1:
+            suite_header = '%s cache suite' % suite.cache_mode.capitalize()
+            lines.append(suite_header)
+            lines.append('-' * len(suite_header))
+            lines.append('')
+        for gr in suite.group_results:
+            header = '%s' % gr.group.name
+            lines.append(header)
+            lines.append('-' * len(header))
+            lines.append('  %s' % gr.group.description)
+            lines.append('')
 
-        # Find the fastest median
-        medians = {
-            name: br.stats['median']
-            for name, br in gr.results.items()
-            if br.wall_times
-        }
-        fastest_name = min(medians, key=medians.get) if medians else None
-
-        max_name_len = max(
-            (len(name) for name in gr.results.keys()), default=10
-        )
-
-        for cfg_name, br in gr.results.items():
-            if not br.wall_times:
-                continue
-            st = br.stats
-            sample_n = int(st.get('n', len(br.wall_times)))
-            lc = br.line_counts[0] if br.line_counts else None
-            lc_str = ' (lines: %s)' % lc if lc is not None else ''
-            fast_marker = '*' if cfg_name == fastest_name else ' '
-            flags = ''
-            if br.is_unreliable:
-                flags += ' [UNRELIABLE cv=%.1f%%]' % (st['cv'] * 100)
-            if br.outlier_count > 0:
-                outlier_vals = [br.wall_times[idx] for idx in br.outlier_indices]
-                flags += ' [%d OUTLIER(S): %s]' % (
-                    br.outlier_count,
-                    ', '.join('%.4fs' % v for v in outlier_vals),
-                )
-            if br.thermal_tainted_count > 0:
-                flags += ' [%d/%d THERMALLY TAINTED]' % (
-                    br.thermal_tainted_count, len(br.wall_times),
-                )
-
-            # Use min/max labels when n < 20
-            if sample_n < 20:
-                range_label = ('min', 'max')
-            else:
-                range_label = ('p5', 'p95')
-            lines.append(
-                '  %s %-*s  median=%.4fs  %s=%.4fs  %s=%.4fs  CV=%.1f%%  cv_mad=%.1f%%%s%s'
-                % (fast_marker, max_name_len + 2, cfg_name,
-                   st['median'], range_label[0], st['p5'],
-                   range_label[1], st['p95'],
-                   st['cv'] * 100, st['cv_mad'] * 100, lc_str, flags)
+            medians = {
+                name: br.stats['median']
+                for name, br in gr.results.items()
+                if br.wall_times
+            }
+            fastest_name = min(medians, key=medians.get) if medians else None
+            max_name_len = max(
+                (len(name) for name in gr.results.keys()), default=10
             )
-        lines.append('')
+
+            for cfg_name, br in gr.results.items():
+                if not br.wall_times:
+                    continue
+                st = br.stats
+                sample_n = int(st.get('n', len(br.wall_times)))
+                lc = br.line_counts[0] if br.line_counts else None
+                lc_str = ' (lines: %s)' % lc if lc is not None else ''
+                fast_marker = '*' if cfg_name == fastest_name else ' '
+                flags = ''
+                if br.is_unreliable:
+                    flags += ' [UNRELIABLE cv=%.1f%%]' % (st['cv'] * 100)
+                if br.outlier_count > 0:
+                    outlier_vals = [br.wall_times[idx] for idx in br.outlier_indices]
+                    flags += ' [%d OUTLIER(S): %s]' % (
+                        br.outlier_count,
+                        ', '.join('%.4fs' % v for v in outlier_vals),
+                    )
+                if br.thermal_tainted_count > 0:
+                    flags += ' [%d/%d THERMALLY TAINTED]' % (
+                        br.thermal_tainted_count, len(br.wall_times),
+                    )
+
+                if sample_n < 20:
+                    range_label = ('min', 'max')
+                else:
+                    range_label = ('p5', 'p95')
+                lines.append(
+                    '  %s %-*s  median=%.4fs  %s=%.4fs  %s=%.4fs  CV=%.1f%%  cv_mad=%.1f%%%s%s'
+                    % (fast_marker, max_name_len + 2, cfg_name,
+                       st['median'], range_label[0], st['p5'],
+                       range_label[1], st['p95'],
+                       st['cv'] * 100, st['cv_mad'] * 100, lc_str, flags)
+                )
+            lines.append('')
+
+        if suite.comparisons:
+            compare_header = 'A/B Comparison (%s cache)' % suite.cache_mode
+            lines.append(compare_header)
+            lines.append('-' * len(compare_header))
+            lines.append('')
+            for comp in suite.comparisons:
+                if comp['is_regression']:
+                    status = 'REGRESSION'
+                elif comp['is_improvement']:
+                    status = 'IMPROVEMENT'
+                elif comp['is_significant']:
+                    status = 'SIGNIFICANT'
+                else:
+                    status = 'NO SIG DIFF'
+                power_str = ', power=%.0f%%' % (comp['power'] * 100)
+                lines.append(
+                    '  [%s] %s/%s: %.4fs -> %.4fs (%+.1f%%, p=%.4f%s)'
+                    % (
+                        status,
+                        comp['group'],
+                        comp['config'],
+                        comp['reference_median'],
+                        comp['candidate_median'],
+                        comp['pct_change'] * 100,
+                        comp['p_value'],
+                        power_str,
+                    )
+                )
+            lines.append('')
 
     # Regressions
     if regressions:
@@ -2090,6 +2394,58 @@ def format_summary(
     return '\n'.join(lines)
 
 
+def collect_suite_warnings(
+    suite_results: Sequence[SuiteResult],
+) -> Tuple[List[str], List[str]]:
+    """Collect reliability, outlier, and thermal warnings from suite results."""
+    unreliable: List[str] = []
+    warnings: List[str] = []
+    for suite in suite_results:
+        for gr in suite.group_results:
+            for cfg_name, br in gr.results.items():
+                benchmark_key = '%s/%s/%s' % (
+                    suite.cache_mode, gr.group.name, cfg_name,
+                )
+                if br.is_unreliable:
+                    unreliable.append(
+                        '%s (cv=%.1f%%, threshold=%.0f%%)'
+                        % (
+                            benchmark_key,
+                            br.stats['cv'] * 100,
+                            br.cv_threshold * 100,
+                        )
+                    )
+                    warnings.append(
+                        'Unreliable: %s has cv=%.1f%% (threshold: %.0f%%)'
+                        % (
+                            benchmark_key,
+                            br.stats['cv'] * 100,
+                            br.cv_threshold * 100,
+                        )
+                    )
+                if br.outlier_count > 0:
+                    outlier_vals = [br.wall_times[idx] for idx in br.outlier_indices]
+                    warnings.append(
+                        'Outliers: %s has %d suspected outlier(s): %s'
+                        % (
+                            benchmark_key,
+                            br.outlier_count,
+                            ', '.join('%.4fs' % v for v in outlier_vals),
+                        )
+                    )
+                if br.thermal_tainted_count > 0:
+                    warnings.append(
+                        'Thermal: %s had %d/%d samples collected during '
+                        'thermal throttling'
+                        % (
+                            benchmark_key,
+                            br.thermal_tainted_count,
+                            len(br.wall_times),
+                        )
+                    )
+    return unreliable, warnings
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -2110,6 +2466,7 @@ Examples:
   %(prog)s --dir /tmp/benchsuite
   %(prog)s --dir /tmp/benchsuite --scenarios thread_scaling,mmap_vs_read
   %(prog)s --dir /tmp/benchsuite --baseline runs/arm-m5-baseline/raw.csv
+  %(prog)s --dir /tmp/benchsuite --compare-bin /tmp/rg-upstream --cache both
   %(prog)s --dir /tmp/benchsuite --list
         ''',
     )
@@ -2121,6 +2478,20 @@ Examples:
         '--bin', metavar='PATH', default=None,
         help='Path to ripgrep binary. If not provided, builds from source '
              'using release-lto profile.',
+    )
+    p.add_argument(
+        '--compare-bin', metavar='PATH', default=None,
+        help='Path to a second ripgrep binary for interleaved A/B comparison.',
+    )
+    p.add_argument(
+        '--primary-label', metavar='NAME', default='candidate',
+        help='Label for the primary binary in A/B comparison output '
+             '(default: candidate).',
+    )
+    p.add_argument(
+        '--compare-label', metavar='NAME', default='baseline',
+        help='Label for --compare-bin in A/B comparison output '
+             '(default: baseline).',
     )
     p.add_argument(
         '--baseline', metavar='PATH', default=None,
@@ -2145,8 +2516,9 @@ Examples:
         help='Path to write human-readable summary (also printed to stdout).',
     )
     p.add_argument(
-        '--cache', choices=['warm', 'cold'], default='warm',
-        help='Cache mode: warm (default) or cold (uses purge, requires sudo).',
+        '--cache', choices=['warm', 'cold', 'both'], default='warm',
+        help='Cache mode: warm (default), cold, or both '
+             '(cold uses purge and requires sudo on macOS).',
     )
     p.add_argument(
         '--sudo', action='store_true', default=False,
@@ -2189,6 +2561,23 @@ Examples:
         eprint('WARNING: --samples %d is below the CLAUDE.md minimum of 5. '
                'Results may not be statistically meaningful.' % args.samples)
 
+    cache_modes = parse_cache_modes(args.cache)
+    if args.compare_bin and args.baseline:
+        eprint(
+            'ERROR: --compare-bin and --baseline are mutually exclusive. '
+            'Use interleaved A/B comparison or baseline CSV comparison, not both.'
+        )
+        return 1
+    if args.primary_label == args.compare_label:
+        eprint('ERROR: --primary-label and --compare-label must differ.')
+        return 1
+    if 'cold' in cache_modes and is_macos() and not args.sudo:
+        eprint(
+            'ERROR: cold-cache benchmarks require --sudo on macOS so the '
+            'page cache can be purged deterministically.'
+        )
+        return 1
+
     # List mode
     if args.list:
         for name in ALL_SCENARIOS:
@@ -2229,52 +2618,66 @@ Examples:
 
     # Build or locate binary
     warnings: List[str] = []
-    build_profile = 'unknown'
+    primary_profile = 'unknown'
 
     if args.bin:
         rg_bin = path.abspath(args.bin)
         if not path.exists(rg_bin):
             eprint('ERROR: Binary not found: %s' % rg_bin)
             return 1
-        # Try to detect profile from path
-        if 'release-lto' in rg_bin:
-            build_profile = 'release-lto'
-        elif 'release' in rg_bin:
-            build_profile = 'release'
+        primary_profile = detect_binary_profile(rg_bin)
+        if primary_profile == 'release':
             warnings.append(
                 'Binary appears to be from --release (not release-lto). '
                 'LTO builds are required for canonical benchmarks.'
             )
-        else:
-            build_profile = 'custom'
+        elif primary_profile == 'custom':
             warnings.append('Unable to determine build profile of binary.')
     else:
         # Try to find an existing binary before building
         existing = find_rg_binary(project_root)
         if existing:
             rg_bin = existing
-            if 'release-lto' in rg_bin:
-                build_profile = 'release-lto'
-            else:
-                build_profile = 'release'
+            primary_profile = detect_binary_profile(rg_bin)
+            if primary_profile != 'release-lto':
                 warnings.append(
                     'Found existing binary at release path (not release-lto). '
                     'LTO builds are required for canonical benchmarks.'
                 )
             eprint('Found existing binary: %s' % rg_bin)
         else:
-            rg_bin, build_profile, build_warnings = build_rg(project_root)
+            rg_bin, primary_profile, build_warnings = build_rg(project_root)
             warnings.extend(build_warnings)
             if not path.exists(rg_bin):
                 eprint('ERROR: Build succeeded but binary not found at: %s' % rg_bin)
                 return 1
 
+    compare_bin: Optional[str] = None
+    compare_profile: Optional[str] = None
+    compare_version: Optional[str] = None
+    if args.compare_bin:
+        compare_bin = path.abspath(args.compare_bin)
+        if not path.exists(compare_bin):
+            eprint('ERROR: Compare binary not found: %s' % compare_bin)
+            return 1
+        compare_profile = detect_binary_profile(compare_bin)
+        if compare_profile == 'release':
+            warnings.append(
+                'Compare binary appears to be from --release (not release-lto).'
+            )
+        compare_version = get_rg_version(compare_bin)
+
     # Record rg version
     rg_version = get_rg_version(rg_bin)
     system_info['rg_version'] = rg_version
     system_info['rg_binary'] = rg_bin
-    system_info['build_profile'] = build_profile
-    eprint('ripgrep: %s (%s, profile=%s)' % (rg_version, rg_bin, build_profile))
+    system_info['build_profile'] = primary_profile
+    eprint('ripgrep: %s (%s, profile=%s)' % (rg_version, rg_bin, primary_profile))
+    if compare_bin is not None:
+        eprint(
+            'compare: %s (%s, profile=%s)'
+            % (compare_version or 'unknown', compare_bin, compare_profile or 'unknown')
+        )
 
     # Ensure suite dir exists
     suite_dir = path.abspath(args.dir)
@@ -2318,14 +2721,21 @@ Examples:
     groups: List[BenchmarkGroup] = []
     for name in scenario_names:
         try:
-            group = ALL_SCENARIOS[name](rg_bin, suite_dir, system_info=system_info)
-            # Apply --samples override if provided
-            if args.samples is not None:
-                for cfg in group.configs:
-                    if name == 'thread_scaling':
-                        cfg.samples = max(args.samples, THREAD_SCALING_SAMPLES)
-                    else:
-                        cfg.samples = args.samples
+            if compare_bin is not None:
+                group = build_ab_group(
+                    name,
+                    rg_bin,
+                    compare_bin,
+                    suite_dir,
+                    system_info,
+                    args.samples,
+                    args.primary_label,
+                    args.compare_label,
+                )
+            else:
+                group = build_scenario_group(
+                    name, rg_bin, suite_dir, system_info, args.samples
+                )
             groups.append(group)
         except RuntimeError as e:
             eprint('SKIP: %s (%s)' % (name, e))
@@ -2338,54 +2748,44 @@ Examples:
     # Add background warnings to warning list
     warnings.extend(bg_warnings)
 
-    # Run benchmarks
-    runner = BenchmarkRunner(
-        rg_bin=rg_bin,
-        suite_dir=suite_dir,
-        thermal=thermal,
-        cache_mode=args.cache,
-        use_sudo=args.sudo,
-        convergence_threshold=args.convergence_threshold,
-    )
+    # Run benchmarks, once per selected cache mode
+    suite_results: List[SuiteResult] = []
+    for suite_idx, cache_mode in enumerate(cache_modes):
+        if len(cache_modes) > 1:
+            eprint('\n### Running %s-cache suite ###' % cache_mode)
+        runner = BenchmarkRunner(
+            rg_bin=rg_bin,
+            suite_dir=suite_dir,
+            thermal=thermal,
+            cache_mode=cache_mode,
+            use_sudo=args.sudo,
+            convergence_threshold=args.convergence_threshold,
+        )
 
-    group_results: List[GroupResult] = []
-    for i, group in enumerate(groups):
-        result = runner.run_group(group)
-        group_results.append(result)
+        group_results: List[GroupResult] = []
+        for i, group in enumerate(groups):
+            result = runner.run_group(group)
+            group_results.append(result)
 
-        # Cooldown between groups (skip after last)
-        if i < len(groups) - 1:
+            # Cooldown between groups (skip after last within suite)
+            if i < len(groups) - 1:
+                thermal.cooldown(args.cooldown)
+
+        suite_results.append(SuiteResult(cache_mode, group_results))
+
+        # Cooldown between cache suites
+        if suite_idx < len(cache_modes) - 1:
             thermal.cooldown(args.cooldown)
 
-    # Check for unreliable results and outliers
-    unreliable_benchmarks: List[str] = []
-    for gr in group_results:
-        for cfg_name, br in gr.results.items():
-            if br.is_unreliable:
-                unreliable_benchmarks.append(
-                    '%s/%s (cv=%.1f%%, threshold=%.0f%%)'
-                    % (gr.group.name, cfg_name,
-                       br.stats['cv'] * 100, br.cv_threshold * 100)
-                )
-                warnings.append(
-                    'Unreliable: %s/%s has cv=%.1f%% (threshold: %.0f%%)'
-                    % (gr.group.name, cfg_name,
-                       br.stats['cv'] * 100, br.cv_threshold * 100)
-                )
-            if br.outlier_count > 0:
-                outlier_vals = [br.wall_times[idx] for idx in br.outlier_indices]
-                warnings.append(
-                    'Outliers: %s/%s has %d suspected outlier(s): %s'
-                    % (gr.group.name, cfg_name, br.outlier_count,
-                       ', '.join('%.4fs' % v for v in outlier_vals))
-                )
-            if br.thermal_tainted_count > 0:
-                warnings.append(
-                    'Thermal: %s/%s had %d/%d samples collected during '
-                    'thermal throttling'
-                    % (gr.group.name, cfg_name,
-                       br.thermal_tainted_count, len(br.wall_times))
-                )
+    if compare_bin is not None:
+        warnings.extend(
+            compare_ab_suites(
+                suite_results, args.primary_label, args.compare_label
+            )
+        )
+
+    unreliable_benchmarks, suite_warnings = collect_suite_warnings(suite_results)
+    warnings.extend(suite_warnings)
 
     # Regression detection
     regressions: List[Dict[str, Any]] = []
@@ -2395,12 +2795,26 @@ Examples:
             warnings.append('Baseline file not found: %s' % args.baseline)
         else:
             baseline = load_baseline(args.baseline)
-            regressions = check_regressions(group_results, baseline)
+            regressions = check_regressions(suite_results, baseline)
+
+    run_metadata: Dict[str, Any] = {
+        'primary_binary': rg_bin,
+        'primary_version': rg_version,
+        'primary_profile': primary_profile,
+        'cache_modes': cache_modes,
+    }
+    if compare_bin is not None:
+        run_metadata.update({
+            'compare_binary': compare_bin,
+            'compare_version': compare_version,
+            'compare_profile': compare_profile,
+            'primary_label': args.primary_label,
+            'compare_label': args.compare_label,
+        })
 
     # Generate summary
     summary_text = format_summary(
-        group_results, system_info, regressions, warnings,
-        build_profile, args.cache,
+        suite_results, system_info, regressions, warnings, run_metadata,
     )
 
     # Print summary to stdout
@@ -2408,13 +2822,13 @@ Examples:
 
     # Write output files
     if args.raw:
-        write_csv(args.raw, group_results, system_info, args.cache)
+        write_csv(args.raw, suite_results, system_info)
         eprint('CSV written to: %s' % args.raw)
 
     if args.json:
         write_json(
-            args.json, group_results, system_info,
-            regressions, warnings, build_profile, args.cache,
+            args.json, suite_results, system_info,
+            regressions, warnings, run_metadata,
         )
         eprint('JSON written to: %s' % args.json)
 
@@ -2433,8 +2847,16 @@ Examples:
 
     # Check for regressions
     has_regression = any(r['is_regression'] for r in regressions)
-    if has_regression:
-        eprint('EXIT CODE 1: Regression(s) detected')
+    has_compare_regression = any(
+        comp['is_regression']
+        for suite in suite_results
+        for comp in suite.comparisons
+    )
+    if has_regression or has_compare_regression:
+        if has_regression:
+            eprint('EXIT CODE 1: Regression(s) detected')
+        else:
+            eprint('EXIT CODE 1: Interleaved A/B regression(s) detected')
         return 1
 
     return 0

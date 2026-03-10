@@ -11,6 +11,7 @@ core topology awareness.
 Canonical standards are defined in CLAUDE.md section "ARM Benchmark Standards".
 
 Usage:
+    ./arm_bench.py --dir /tmp/benchsuite --download all
     ./arm_bench.py --dir /tmp/benchsuite
     ./arm_bench.py --dir /tmp/benchsuite --baseline runs/arm-m5-baseline/raw.csv
     ./arm_bench.py --dir /tmp/benchsuite --compare-bin /tmp/rg-upstream --cache both
@@ -553,9 +554,80 @@ def require_corpus(suite_dir: str, name: str) -> None:
     if not checks[name](suite_dir):
         raise RuntimeError(
             'Corpus "%s" not found in %s. '
-            'Run: benchsuite/benchsuite --dir %s --download %s'
+            'Run: arm_bench.py --dir %s --download %s'
             % (name, suite_dir, suite_dir, name)
         )
+
+
+# ---------------------------------------------------------------------------
+# Corpus download helpers
+# ---------------------------------------------------------------------------
+
+
+def download_linux(suite_dir: str) -> None:
+    """Download the Linux kernel source tree (shallow clone, no build).
+
+    Unlike benchsuite/benchsuite which also builds the kernel (requiring
+    a Linux-compatible toolchain), this only clones the source tree.
+    That is sufficient for search benchmarks.
+    """
+    checkout_dir = path.join(suite_dir, LINUX_DIR)
+    if path.isdir(checkout_dir) and has_linux(suite_dir):
+        eprint('Linux corpus already present at %s' % checkout_dir)
+        return
+    eprint('Downloading Linux kernel source tree...')
+    run_cmd(['git', 'clone', '--depth', '1', LINUX_CLONE, checkout_dir])
+    if not has_linux(suite_dir):
+        raise RuntimeError('Clone succeeded but Makefile not found in %s' % checkout_dir)
+    eprint('Linux corpus ready.')
+
+
+def download_subtitles_en(suite_dir: str) -> None:
+    """Download and decompress English subtitles, then create a sample file."""
+    subtitle_dir = path.join(suite_dir, SUBTITLES_DIR)
+    en_path_gz = path.join(subtitle_dir, SUBTITLES_EN_NAME_GZ)
+    en_path = path.join(subtitle_dir, SUBTITLES_EN_NAME)
+    en_path_sample = path.join(subtitle_dir, SUBTITLES_EN_NAME_SAMPLE)
+
+    if path.exists(en_path_sample):
+        eprint('English subtitles corpus already present at %s' % en_path_sample)
+        return
+
+    os.makedirs(subtitle_dir, exist_ok=True)
+
+    if not path.exists(en_path):
+        if not path.exists(en_path_gz):
+            eprint('Downloading English subtitles (~2.7 GB compressed)...')
+            run_cmd(['curl', '-LO', SUBTITLES_EN_URL], cwd=subtitle_dir)
+        eprint('Decompressing...')
+        run_cmd(['gunzip', en_path_gz])
+
+    eprint('Creating sample file (first 55M lines)...')
+    with open(en_path_sample, 'wb') as f:
+        run_cmd(
+            ['head', '-n', '55000000', en_path],
+            cwd=subtitle_dir, stdout=f,
+        )
+    eprint('English subtitles corpus ready.')
+
+
+def download_corpus(suite_dir: str, choices: List[str]) -> None:
+    """Download benchmark corpora into suite_dir.
+
+    Valid choices: linux, subtitles-en, all.
+    """
+    os.makedirs(suite_dir, exist_ok=True)
+    for choice in choices:
+        if choice == 'linux':
+            download_linux(suite_dir)
+        elif choice == 'subtitles-en':
+            download_subtitles_en(suite_dir)
+        elif choice == 'all':
+            download_linux(suite_dir)
+            download_subtitles_en(suite_dir)
+        else:
+            eprint('Unknown corpus: %s (valid: linux, subtitles-en, all)' % choice)
+            sys.exit(1)
 
 
 def linux_dir(suite_dir: str) -> str:
@@ -2463,6 +2535,7 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
+  %(prog)s --dir /tmp/benchsuite --download all
   %(prog)s --dir /tmp/benchsuite
   %(prog)s --dir /tmp/benchsuite --scenarios thread_scaling,mmap_vs_read
   %(prog)s --dir /tmp/benchsuite --baseline runs/arm-m5-baseline/raw.csv
@@ -2473,6 +2546,14 @@ Examples:
     p.add_argument(
         '--dir', metavar='PATH', default=os.getcwd(),
         help='Directory containing benchmark corpora (default: cwd).',
+    )
+    p.add_argument(
+        '--download', metavar='CORPUS', nargs='+',
+        choices=['linux', 'subtitles-en', 'all'],
+        help='Download benchmark corpora and exit. '
+             'Choices: linux, subtitles-en, all. '
+             'Unlike benchsuite/benchsuite, this does NOT attempt to build '
+             'the Linux kernel (which fails on macOS).',
     )
     p.add_argument(
         '--bin', metavar='PATH', default=None,
@@ -2577,6 +2658,11 @@ Examples:
             'page cache can be purged deterministically.'
         )
         return 1
+
+    # Download mode
+    if args.download:
+        download_corpus(path.abspath(args.dir), args.download)
+        return 0
 
     # List mode
     if args.list:
@@ -2683,7 +2769,7 @@ Examples:
     suite_dir = path.abspath(args.dir)
     if not path.isdir(suite_dir):
         eprint('ERROR: Suite directory does not exist: %s' % suite_dir)
-        eprint('Run: benchsuite/benchsuite --dir %s --download all' % suite_dir)
+        eprint('Run: arm_bench.py --dir %s --download all' % suite_dir)
         return 1
 
     # Determine scenarios to run

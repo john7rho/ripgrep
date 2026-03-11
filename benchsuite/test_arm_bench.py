@@ -1,6 +1,8 @@
 import csv
 import importlib.util
+import json
 import pathlib
+import plistlib
 import sys
 import tempfile
 import unittest
@@ -28,6 +30,52 @@ def make_result(name, logical_name, label):
 
 
 class ArmBenchWorkflowTests(unittest.TestCase):
+    def test_summarize_powermetrics_capture_extracts_pcore_share(self):
+        payload_a = {
+            "tasks": [
+                {
+                    "pid": 4242,
+                    "name": "rg",
+                    "cputime_sample_ms_per_s": 60.0,
+                    "cpu_cycles": 100.0,
+                    "pcpu_cycles": 75.0,
+                    "cpu_instructions": 200.0,
+                    "pcpu_instructions": 150.0,
+                    "clusters": [
+                        {"name": "P-Cluster", "cputime_sample_ms_per_s": 55.0},
+                        {"name": "E-Cluster", "cputime_sample_ms_per_s": 5.0},
+                    ],
+                }
+            ]
+        }
+        payload_b = {
+            "tasks": [
+                {
+                    "pid": 4242,
+                    "name": "rg",
+                    "cputime_sample_ms_per_s": 40.0,
+                    "cpu_cycles": 100.0,
+                    "pcpu_cycles": 50.0,
+                    "cpu_instructions": 100.0,
+                    "pcpu_instructions": 50.0,
+                    "clusters": [
+                        {"name": "P-Cluster", "cputime_sample_ms_per_s": 20.0},
+                        {"name": "E-Cluster", "cputime_sample_ms_per_s": 20.0},
+                    ],
+                }
+            ]
+        }
+        raw = plistlib.dumps(payload_a) + b"\0" + plistlib.dumps(payload_b)
+
+        summary = arm_bench.summarize_powermetrics_capture(raw, 4242)
+
+        self.assertEqual("ok", summary["telemetry_status"])
+        self.assertTrue(summary["p_core_dispatch_observed"])
+        self.assertEqual(2, summary["telemetry_sample_count"])
+        self.assertEqual(2, summary["p_core_dispatch_sample_count"])
+        self.assertAlmostEqual(0.625, summary["p_core_share"])
+        self.assertEqual(75.0, summary["p_core_cycles"])
+
     def test_parse_cache_modes_both(self):
         self.assertEqual(
             ["warm", "cold"],
@@ -153,6 +201,20 @@ class ArmBenchWorkflowTests(unittest.TestCase):
         group_result.results[cfg.name].thermal_states = [
             "nominal", "fair", "nominal", "nominal", "nominal"
         ]
+        group_result.results[cfg.name].sample_metadata = [
+            {
+                "contention_active": True,
+                "contention_kind": "cpu_hoggers",
+                "contention_workers": 4,
+                "telemetry_status": "ok",
+                "p_core_dispatch_observed": True,
+                "p_core_share": 0.75,
+                "p_core_cycles": 75.0,
+                "cpu_cycles": 100.0,
+                "sample_cpu_ms_per_s": 40.0,
+                "cluster_cpu_ms_per_s": {"P-Cluster": 35.0, "E-Cluster": 5.0},
+            }
+        ] + [{} for _ in range(4)]
         suite = arm_bench.SuiteResult("warm", [group_result])
 
         system_info = {"chip": "Test", "core_topology": {"logical": 4}}
@@ -171,6 +233,12 @@ class ArmBenchWorkflowTests(unittest.TestCase):
         self.assertEqual("0", rows[3]["clean_sample"])
         self.assertEqual("3", rows[0]["clean_n"])
         self.assertEqual("1.000000", rows[0]["best_clean"])
+        self.assertEqual("1", rows[0]["contention"])
+        self.assertEqual("cpu_hoggers", rows[0]["contention_kind"])
+        self.assertEqual("4", rows[0]["contention_workers"])
+        self.assertEqual("ok", rows[0]["telemetry_status"])
+        self.assertEqual("1", rows[0]["p_core_dispatch"])
+        self.assertEqual("0.7500", rows[0]["p_core_share"])
 
     def test_load_baseline_skips_unclean_rows(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -220,6 +288,201 @@ class ArmBenchWorkflowTests(unittest.TestCase):
 
         self.assertTrue(warnings)
         self.assertEqual(["mdutil", "-s", tmpdir], calls[0])
+
+    def test_thread_scaling_contention_requires_sudo_ready(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            linux_dir = pathlib.Path(tmpdir) / "linux"
+            linux_dir.mkdir()
+            (linux_dir / "Makefile").write_text("all:\n", encoding="utf-8")
+            system_info = {
+                "is_apple_silicon": True,
+                "powermetrics_available": True,
+                "sudo_enabled": True,
+                "sudo_ready": False,
+                "core_topology": {
+                    "level0": {"name": "Performance", "logical": 4, "physical": 4},
+                    "level1": {"name": "Efficiency", "logical": 4, "physical": 4},
+                },
+                "total_logical_cpus": 8,
+            }
+
+            with self.assertRaises(RuntimeError):
+                arm_bench.scenario_thread_scaling_contention("rg", tmpdir, system_info)
+
+    def test_thread_scaling_contention_builds_controller_backed_configs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            linux_dir = pathlib.Path(tmpdir) / "linux"
+            linux_dir.mkdir()
+            (linux_dir / "Makefile").write_text("all:\n", encoding="utf-8")
+            system_info = {
+                "is_apple_silicon": True,
+                "powermetrics_available": True,
+                "sudo_enabled": True,
+                "sudo_ready": True,
+                "core_topology": {
+                    "level0": {"name": "Performance", "logical": 4, "physical": 4},
+                    "level1": {"name": "Efficiency", "logical": 4, "physical": 4},
+                },
+                "total_logical_cpus": 8,
+            }
+
+            group = arm_bench.scenario_thread_scaling_contention("rg", tmpdir, system_info)
+
+        self.assertIn("thread_scaling_contention", arm_bench.ALL_SCENARIOS)
+        self.assertEqual("thread_scaling_contention", group.name)
+        self.assertTrue(group.configs)
+        self.assertTrue(all(cfg.sample_controller_factory is not None for cfg in group.configs))
+        self.assertIn("contend", group.configs[0].name)
+
+    def test_execute_config_uses_sample_controller_hooks(self):
+        events = []
+
+        class FakeController(arm_bench.SampleController):
+            def __init__(self, collect_telemetry):
+                self.collect_telemetry = collect_telemetry
+                events.append(("init", collect_telemetry))
+
+            def start(self):
+                events.append("start")
+
+            def attach_process(self, proc):
+                events.append(("attach", proc.pid))
+
+            def stop(self):
+                events.append("stop")
+                return {"contention_active": True, "telemetry_status": "ok"}
+
+        cfg = arm_bench.BenchmarkConfig(
+            name="rg literal",
+            logical_name="rg literal",
+            cmd=["rg", "literal"],
+            sample_controller_factory=lambda collect: FakeController(collect),
+        )
+        runner = arm_bench.BenchmarkRunner(
+            rg_bin="rg",
+            suite_dir=".",
+            thermal=mock.Mock(),
+        )
+
+        def fake_run_timed(cmd, cwd=None, count_lines=False, process_started=None):
+            proc = mock.Mock()
+            proc.pid = 321
+            if process_started is not None:
+                process_started(proc)
+            return arm_bench.TimingResult(
+                wall_time=1.0,
+                user_time=0.2,
+                sys_time=0.1,
+                line_count=None,
+                returncode=0,
+            )
+
+        with mock.patch.object(arm_bench, "run_timed", side_effect=fake_run_timed):
+            _, metadata = runner._execute_config(
+                cfg, count_lines=False, collect_telemetry=True
+            )
+
+        self.assertEqual(
+            [("init", True), "start", ("attach", 321), "stop"],
+            events,
+        )
+        self.assertEqual("ok", metadata["telemetry_status"])
+
+    def test_format_summary_includes_scheduler_placement(self):
+        cfg = arm_bench.BenchmarkConfig(
+            name="rg -j4 (contended)",
+            logical_name="rg -j4",
+            cmd=["rg", "-j4", "literal"],
+        )
+        group = arm_bench.BenchmarkGroup(
+            name="thread_scaling_contention",
+            description="synthetic",
+            configs=[cfg],
+        )
+        group_result = arm_bench.GroupResult(group)
+        result = group_result.results[cfg.name]
+        result.wall_times = [1.0, 1.1, 1.2, 1.05, 1.15]
+        result.user_times = [0.1] * 5
+        result.sys_times = [0.01] * 5
+        result.thermal_states = ["nominal"] * 5
+        result.sample_metadata = [
+            {
+                "contention_active": True,
+                "telemetry_status": "ok",
+                "p_core_dispatch_observed": True,
+                "p_core_share": 0.80,
+            },
+            {
+                "contention_active": True,
+                "telemetry_status": "ok",
+                "p_core_dispatch_observed": True,
+                "p_core_share": 0.70,
+            },
+            {
+                "contention_active": True,
+                "telemetry_status": "ok",
+                "p_core_dispatch_observed": False,
+                "p_core_share": 0.0,
+            },
+            {"contention_active": True, "telemetry_status": "no_matching_task"},
+            {"contention_active": True, "telemetry_status": "powermetrics_failed"},
+        ]
+        suite = arm_bench.SuiteResult("warm", [group_result])
+
+        summary = arm_bench.format_summary(
+            [suite],
+            {"chip": "Test", "arch": "arm64", "os_version": "14.0", "memory_gb": 16, "rust_version": "rustc test"},
+            [],
+            [],
+            {"primary_profile": "release-lto", "cache_modes": ["warm"], "primary_version": "rg test", "primary_binary": "/tmp/rg", "sample_retries": 1},
+        )
+
+        self.assertIn("Scheduler placement:", summary)
+        self.assertIn("P-core dispatch observed in 2/3 telemetry sample(s)", summary)
+
+    def test_write_json_includes_sample_metadata_and_placement_summary(self):
+        cfg = arm_bench.BenchmarkConfig(
+            name="rg -j4 (contended)",
+            logical_name="rg -j4",
+            cmd=["rg", "-j4", "literal"],
+        )
+        group = arm_bench.BenchmarkGroup(
+            name="thread_scaling_contention",
+            description="synthetic",
+            configs=[cfg],
+        )
+        group_result = arm_bench.GroupResult(group)
+        result = group_result.results[cfg.name]
+        result.wall_times = [1.0, 1.1, 1.2, 1.3, 1.4]
+        result.user_times = [0.1] * 5
+        result.sys_times = [0.01] * 5
+        result.thermal_states = ["nominal"] * 5
+        result.sample_metadata = [
+            {
+                "contention_active": True,
+                "telemetry_status": "ok",
+                "p_core_dispatch_observed": True,
+                "p_core_share": 0.75,
+            }
+        ] + [{} for _ in range(4)]
+        suite = arm_bench.SuiteResult("warm", [group_result])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outpath = pathlib.Path(tmpdir) / "out.json"
+            arm_bench.write_json(
+                str(outpath),
+                [suite],
+                {"chip": "Test"},
+                [],
+                [],
+                {"primary_binary": "/tmp/rg", "primary_version": "rg test", "primary_profile": "release-lto", "cache_modes": ["warm"]},
+            )
+            payload = json.loads(outpath.read_text(encoding="utf-8"))
+
+        config_data = payload["benchmarks"]["thread_scaling_contention"]["configs"]["rg -j4 (contended)"]
+        self.assertIn("sample_metadata", config_data)
+        self.assertIn("placement_summary", config_data)
+        self.assertTrue(config_data["placement_summary"]["contention_enabled"])
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ Please see the [CHANGELOG](CHANGELOG.md) for a release history.
 * [Configuration files](GUIDE.md#configuration-file)
 * [Shell completions](FAQ.md#complete)
 * [Building](#building)
+* [ARM Benchmark Runner](benchsuite/ARM_BENCHMARKS.md)
 * [Translations](#translations)
 
 

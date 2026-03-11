@@ -26,14 +26,16 @@ import math
 import os
 import os.path as path
 import platform
+import plistlib
 import random
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
 import time
 from collections import Counter
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 try:
     import resource
@@ -78,6 +80,17 @@ COOLDOWN_MIN_SECONDS = 30
 DEFAULT_SAMPLE_RETRIES = 6
 RETRY_COOLDOWN_SECONDS = 10
 MIN_COMPARISON_SAMPLES = 5
+CONTENTION_SAMPLE_RATE_MS = 50
+POWERMETRICS_SAMPLE_BUFFER = 0
+CPU_HOGGER_SNIPPET = (
+    'import sys\n'
+    'import signal\n'
+    'signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n'
+    'signal.signal(signal.SIGINT, lambda *_: sys.exit(0))\n'
+    'x = 0\n'
+    'while True:\n'
+    '    x = (x + 1) & 0xFFFFFFFF\n'
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -281,7 +294,46 @@ def detect_system_info() -> Dict[str, Any]:
     except Exception:
         pass
 
+    info['powermetrics_available'] = shutil.which('powermetrics') is not None
+
     return info
+
+
+def performance_core_logical_count(
+    system_info: Optional[Dict[str, Any]] = None,
+) -> Optional[int]:
+    """Return the logical P-core count when topology data is available."""
+    if system_info is None:
+        return None
+    topo = system_info.get('core_topology')
+    if not isinstance(topo, dict):
+        return None
+    for level_key in sorted(topo.keys()):
+        entry = topo.get(level_key)
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get('name', '')).lower()
+        logical = entry.get('logical')
+        if (
+            isinstance(logical, int)
+            and logical > 0
+            and ('performance' in name or name.startswith('p'))
+        ):
+            return logical
+    return None
+
+
+def check_sudo_ready() -> bool:
+    """Return True when non-interactive sudo is available."""
+    try:
+        result = subprocess.run(
+            ['sudo', '-n', 'true'],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +707,349 @@ def detect_binary_profile(rg_bin: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Contention and placement telemetry
+# ---------------------------------------------------------------------------
+
+
+def _iter_task_entries(value: Any) -> List[Dict[str, Any]]:
+    """Recursively collect powermetrics task dictionaries."""
+    tasks: List[Dict[str, Any]] = []
+    if isinstance(value, dict):
+        entries = value.get('tasks')
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict):
+                    tasks.append(entry)
+        for child in value.values():
+            tasks.extend(_iter_task_entries(child))
+    elif isinstance(value, list):
+        for child in value:
+            tasks.extend(_iter_task_entries(child))
+    return tasks
+
+
+def _parse_powermetrics_plists(raw: bytes) -> List[Dict[str, Any]]:
+    """Parse one or more NUL-separated powermetrics plist payloads."""
+    payloads: List[Dict[str, Any]] = []
+    for chunk in raw.split(b'\0'):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            doc = plistlib.loads(chunk)
+        except Exception:
+            continue
+        if isinstance(doc, dict):
+            payloads.append(doc)
+    return payloads
+
+
+def _cluster_name(cluster: Dict[str, Any]) -> str:
+    """Normalize a powermetrics cluster name for reporting."""
+    name = cluster.get('name')
+    if isinstance(name, str) and name:
+        return name
+    cluster_type = cluster.get('cluster-type')
+    if isinstance(cluster_type, str) and cluster_type:
+        return cluster_type
+    cluster_id = cluster.get('cluster-id')
+    if cluster_id is not None:
+        return 'cluster-%s' % cluster_id
+    return 'cluster'
+
+
+def _is_p_core_cluster(name: str) -> bool:
+    """Return True if a cluster name appears to refer to P/performance cores."""
+    lower = name.lower()
+    return (
+        lower.startswith('p')
+        or 'performance' in lower
+        or 'perf' in lower
+    )
+
+
+def summarize_powermetrics_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize one powermetrics task entry into placement-friendly metrics."""
+    cpu_cycles = float(task.get('cpu_cycles', 0.0) or 0.0)
+    pcpu_cycles = float(task.get('pcpu_cycles', 0.0) or 0.0)
+    cpu_instr = float(task.get('cpu_instructions', 0.0) or 0.0)
+    pcpu_instr = float(task.get('pcpu_instructions', 0.0) or 0.0)
+    sample_cpu_ms = float(task.get('cputime_sample_ms_per_s', 0.0) or 0.0)
+
+    cluster_times: Dict[str, float] = {}
+    p_cluster_time = 0.0
+    total_cluster_time = 0.0
+    clusters = task.get('clusters')
+    if isinstance(clusters, list):
+        for cluster in clusters:
+            if not isinstance(cluster, dict):
+                continue
+            name = _cluster_name(cluster)
+            residency = float(
+                cluster.get('cputime_sample_ms_per_s')
+                or cluster.get('cputime_ms_per_s')
+                or cluster.get('residency_ms_per_s')
+                or 0.0
+            )
+            cluster_times[name] = residency
+            total_cluster_time += residency
+            if _is_p_core_cluster(name):
+                p_cluster_time += residency
+
+    p_share: Optional[float] = None
+    if cpu_cycles > 0:
+        p_share = max(0.0, min(1.0, pcpu_cycles / cpu_cycles))
+    elif cpu_instr > 0:
+        p_share = max(0.0, min(1.0, pcpu_instr / cpu_instr))
+    elif total_cluster_time > 0:
+        p_share = max(0.0, min(1.0, p_cluster_time / total_cluster_time))
+
+    observed: Optional[bool]
+    if p_share is not None:
+        observed = p_share > 0.0
+    elif p_cluster_time > 0:
+        observed = True
+    elif cpu_cycles > 0 or cpu_instr > 0 or total_cluster_time > 0:
+        observed = False
+    else:
+        observed = None
+
+    return {
+        'pid': task.get('pid'),
+        'name': task.get('name'),
+        'sample_cpu_ms_per_s': sample_cpu_ms,
+        'cpu_cycles': cpu_cycles,
+        'p_core_cycles': pcpu_cycles,
+        'cpu_instructions': cpu_instr,
+        'p_core_instructions': pcpu_instr,
+        'cluster_cpu_ms_per_s': cluster_times,
+        'p_cluster_cpu_ms_per_s': p_cluster_time,
+        'total_cluster_cpu_ms_per_s': total_cluster_time,
+        'p_core_share': p_share,
+        'p_core_dispatch_observed': observed,
+    }
+
+
+def summarize_powermetrics_capture(
+    raw: bytes,
+    target_pid: Optional[int],
+) -> Dict[str, Any]:
+    """Summarize powermetrics AMP/plist output for one target process."""
+    payloads = _parse_powermetrics_plists(raw)
+    if target_pid is None:
+        return {
+            'telemetry_status': 'missing_target_pid',
+            'powermetrics_payload_count': len(payloads),
+        }
+
+    matching: List[Dict[str, Any]] = []
+    for payload in payloads:
+        for task in _iter_task_entries(payload):
+            if task.get('pid') == target_pid:
+                matching.append(summarize_powermetrics_task(task))
+
+    if not matching:
+        return {
+            'telemetry_status': 'no_matching_task',
+            'powermetrics_payload_count': len(payloads),
+            'target_pid': target_pid,
+        }
+
+    best = max(
+        matching,
+        key=lambda item: (
+            item.get('sample_cpu_ms_per_s', 0.0),
+            item.get('cpu_cycles', 0.0),
+            item.get('cpu_instructions', 0.0),
+        ),
+    )
+    shares = [
+        float(item['p_core_share'])
+        for item in matching
+        if isinstance(item.get('p_core_share'), (int, float))
+    ]
+    observed = [
+        bool(item['p_core_dispatch_observed'])
+        for item in matching
+        if item.get('p_core_dispatch_observed') is not None
+    ]
+
+    summary = dict(best)
+    summary.update({
+        'telemetry_status': 'ok',
+        'powermetrics_payload_count': len(payloads),
+        'powermetrics_match_count': len(matching),
+        'p_core_dispatch_sample_count': sum(1 for value in observed if value),
+        'telemetry_sample_count': len(observed),
+        'p_core_dispatch_observed': (
+            any(observed) if observed else best.get('p_core_dispatch_observed')
+        ),
+        'p_core_share': statistics.median(shares) if shares else best.get('p_core_share'),
+    })
+    return summary
+
+
+class SampleController:
+    """Runner-managed per-sample lifecycle hook."""
+
+    def start(self) -> None:
+        """Prepare the environment before the timed process starts."""
+
+    def attach_process(self, proc: Any) -> None:
+        """Receive the process handle for the command being timed."""
+
+    def stop(self) -> Dict[str, Any]:
+        """Tear down the sample environment and return metadata."""
+        return {}
+
+
+class ContentionSampleController(SampleController):
+    """Spawn CPU hoggers and collect per-process AMP telemetry."""
+
+    def __init__(
+        self,
+        contender_count: int,
+        collect_telemetry: bool = True,
+        sample_rate_ms: int = CONTENTION_SAMPLE_RATE_MS,
+    ) -> None:
+        self.contender_count = contender_count
+        self.collect_telemetry = collect_telemetry
+        self.sample_rate_ms = sample_rate_ms
+        self._target_pid: Optional[int] = None
+        self._target_name: Optional[str] = None
+        self._contenders: List[Any] = []
+        self._powermetrics: Optional[Any] = None
+        self._powermetrics_error: Optional[str] = None
+
+    def start(self) -> None:
+        for _ in range(self.contender_count):
+            proc = subprocess.Popen(
+                [sys.executable, '-c', CPU_HOGGER_SNIPPET],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._contenders.append(proc)
+        if self.collect_telemetry:
+            self._start_powermetrics()
+
+    def attach_process(self, proc: Any) -> None:
+        self._target_pid = proc.pid
+        self._target_name = path.basename(proc.args[0]) if isinstance(proc.args, list) else None
+
+    def stop(self) -> Dict[str, Any]:
+        metadata = {
+            'contention_active': True,
+            'contention_kind': 'cpu_hoggers',
+            'contention_workers': self.contender_count,
+            'telemetry_status': 'disabled',
+        }
+        try:
+            if self.collect_telemetry:
+                metadata.update(self._stop_powermetrics())
+        finally:
+            self._stop_contenders()
+        if self._target_pid is not None:
+            metadata['target_pid'] = self._target_pid
+        if self._target_name:
+            metadata['target_name'] = self._target_name
+        return metadata
+
+    def _start_powermetrics(self) -> None:
+        try:
+            self._powermetrics = subprocess.Popen(
+                [
+                    'sudo', '-n', 'powermetrics',
+                    '--format', 'plist',
+                    '--buffer-size', str(POWERMETRICS_SAMPLE_BUFFER),
+                    '--sample-rate', str(self.sample_rate_ms),
+                    '--sample-count', '-1',
+                    '--samplers', 'tasks',
+                    '--show-process-amp',
+                    '--show-process-ipc',
+                    '--show-process-samp-norm',
+                    '--handle-invalid-values',
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except Exception as exc:
+            self._powermetrics_error = str(exc)
+
+    def _stop_powermetrics(self) -> Dict[str, Any]:
+        if self._powermetrics is None:
+            if self._powermetrics_error:
+                return {
+                    'telemetry_status': 'powermetrics_start_failed',
+                    'telemetry_error': self._powermetrics_error,
+                }
+            return {'telemetry_status': 'powermetrics_not_started'}
+
+        if hasattr(signal, 'SIGINFO'):
+            try:
+                self._powermetrics.send_signal(signal.SIGINFO)
+                time.sleep(max(self.sample_rate_ms / 1000.0, 0.02))
+            except Exception:
+                pass
+        try:
+            self._powermetrics.send_signal(signal.SIGINT)
+        except Exception:
+            self._powermetrics.terminate()
+
+        try:
+            stdout, stderr = self._powermetrics.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._powermetrics.kill()
+            stdout, stderr = self._powermetrics.communicate()
+
+        if self._powermetrics.returncode not in (0, -signal.SIGINT, 130):
+            err_text = stderr.decode('utf-8', errors='replace').strip()
+            return {
+                'telemetry_status': 'powermetrics_failed',
+                'telemetry_error': err_text or 'powermetrics exited with %s' % self._powermetrics.returncode,
+            }
+
+        summary = summarize_powermetrics_capture(stdout, self._target_pid)
+        if stderr:
+            err_text = stderr.decode('utf-8', errors='replace').strip()
+            if err_text:
+                summary['telemetry_stderr'] = err_text
+        return summary
+
+    def _stop_contenders(self) -> None:
+        for proc in self._contenders:
+            if proc.poll() is not None:
+                continue
+            proc.terminate()
+        deadline = time.time() + 2.0
+        for proc in self._contenders:
+            if proc.poll() is not None:
+                continue
+            remaining = max(deadline - time.time(), 0.0)
+            try:
+                proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        for proc in self._contenders:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+
+def make_contention_controller_factory(
+    contender_count: int,
+) -> Callable[[bool], SampleController]:
+    """Return a controller factory for contention scenarios."""
+
+    def factory(collect_telemetry: bool) -> SampleController:
+        return ContentionSampleController(
+            contender_count=contender_count,
+            collect_telemetry=collect_telemetry,
+        )
+
+    return factory
+
+
+# ---------------------------------------------------------------------------
 # Timing and execution
 # ---------------------------------------------------------------------------
 
@@ -683,6 +1078,7 @@ def run_timed(
     cmd: List[str],
     cwd: Optional[str] = None,
     count_lines: bool = False,
+    process_started: Optional[Callable[[Any], None]] = None,
 ) -> TimingResult:
     """Run a command and measure wall, user, and sys time.
 
@@ -711,7 +1107,10 @@ def run_timed(
         ru_before = None
 
     start = time.monotonic()
-    completed = subprocess.run(cmd, **kwargs)
+    proc = subprocess.Popen(cmd, **kwargs)
+    if process_started is not None:
+        process_started(proc)
+    stdout_data, _ = proc.communicate()
     end = time.monotonic()
 
     wall_time = end - start
@@ -724,15 +1123,15 @@ def run_timed(
         sys_time = 0.0
 
     line_count = None
-    if count_lines and completed.stdout is not None:
-        line_count = completed.stdout.count(b'\n')
+    if count_lines and stdout_data is not None:
+        line_count = stdout_data.count(b'\n')
 
     return TimingResult(
         wall_time=wall_time,
         user_time=user_time,
         sys_time=sys_time,
         line_count=line_count,
-        returncode=completed.returncode,
+        returncode=proc.returncode,
     )
 
 
@@ -1034,6 +1433,7 @@ class BenchmarkConfig:
         cv_threshold: Optional[float] = None,
         logical_name: Optional[str] = None,
         variant_label: Optional[str] = None,
+        sample_controller_factory: Optional[Callable[[bool], SampleController]] = None,
     ) -> None:
         self.name = name
         self.cmd = cmd
@@ -1043,6 +1443,7 @@ class BenchmarkConfig:
         self.cv_threshold = cv_threshold  # None means use group/global default
         self.logical_name = name if logical_name is None else logical_name
         self.variant_label = variant_label
+        self.sample_controller_factory = sample_controller_factory
 
 
 class BenchmarkGroup:
@@ -1075,6 +1476,7 @@ class BenchmarkResult:
         self.line_counts: List[Optional[int]] = []
         self.thermal_states: List[str] = []
         self.cpu_frequencies: List[Optional[Dict[str, int]]] = []
+        self.sample_metadata: List[Dict[str, Any]] = []
         self._cached_stats: Optional[Dict[str, float]] = None
         self._cached_stats_len: int = 0
 
@@ -1163,6 +1565,48 @@ class BenchmarkResult:
         if len(clean) >= MIN_COMPARISON_SAMPLES:
             return clean
         return self.wall_times
+
+    @property
+    def placement_summary(self) -> Optional[Dict[str, Any]]:
+        """Aggregate P-core dispatch evidence across all recorded samples."""
+        if not self.sample_metadata:
+            return None
+        telemetry_samples = [
+            meta for meta in self.sample_metadata
+            if meta.get('telemetry_status') == 'ok'
+        ]
+        shares = [
+            float(meta['p_core_share'])
+            for meta in telemetry_samples
+            if isinstance(meta.get('p_core_share'), (int, float))
+        ]
+        observed = [
+            bool(meta['p_core_dispatch_observed'])
+            for meta in telemetry_samples
+            if meta.get('p_core_dispatch_observed') is not None
+        ]
+        summary: Dict[str, Any] = {
+            'contention_enabled': any(
+                bool(meta.get('contention_active')) for meta in self.sample_metadata
+            ),
+            'telemetry_sample_count': len(observed),
+            'status_counts': dict(
+                Counter(
+                    str(meta.get('telemetry_status', 'missing'))
+                    for meta in self.sample_metadata
+                )
+            ),
+        }
+        if telemetry_samples:
+            summary['telemetry_ok_count'] = len(telemetry_samples)
+        if observed:
+            summary['p_core_dispatch_sample_count'] = sum(
+                1 for value in observed if value
+            )
+            summary['p_core_dispatch_observed'] = any(observed)
+        if shares:
+            summary['p_core_share'] = statistics.median(shares)
+        return summary
 
 
 class GroupResult:
@@ -1273,9 +1717,11 @@ class BenchmarkRunner:
 
         for w in range(warmup_count):
             for cfg in group.configs:
-                if self.cache_mode == 'cold':
-                    purge_cache(self.use_sudo)
-                timing = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=False)
+                timing, _ = self._execute_config(
+                    cfg,
+                    count_lines=False,
+                    collect_telemetry=False,
+                )
                 # Track last 3 times
                 last_times[cfg.name].append(timing.wall_time)
                 if len(last_times[cfg.name]) > 3:
@@ -1300,7 +1746,11 @@ class BenchmarkRunner:
                 break
             eprint('  [warmup] Not converged, running extra warmup %d...' % (extra + 1))
             for cfg in group.configs:
-                timing = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=False)
+                timing, _ = self._execute_config(
+                    cfg,
+                    count_lines=False,
+                    collect_telemetry=False,
+                )
                 last_times[cfg.name].append(timing.wall_time)
                 if len(last_times[cfg.name]) > 3:
                     last_times[cfg.name] = last_times[cfg.name][-3:]
@@ -1352,6 +1802,7 @@ class BenchmarkRunner:
         timing: TimingResult,
         thermal_state: str,
         cpu_freq: Optional[Dict[str, int]],
+        sample_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Append one sample to a benchmark result."""
         br.wall_times.append(timing.wall_time)
@@ -1359,6 +1810,36 @@ class BenchmarkRunner:
         br.sys_times.append(timing.sys_time)
         br.thermal_states.append(thermal_state)
         br.cpu_frequencies.append(cpu_freq)
+        br.sample_metadata.append({} if sample_metadata is None else sample_metadata)
+
+    def _execute_config(
+        self,
+        cfg: BenchmarkConfig,
+        count_lines: bool,
+        collect_telemetry: bool,
+    ) -> Tuple[TimingResult, Dict[str, Any]]:
+        """Run one config invocation with optional sample controller hooks."""
+        if self.cache_mode == 'cold':
+            purge_cache(self.use_sudo)
+
+        controller: Optional[SampleController] = None
+        if cfg.sample_controller_factory is not None:
+            controller = cfg.sample_controller_factory(collect_telemetry)
+
+        metadata: Dict[str, Any] = {}
+        if controller is not None:
+            controller.start()
+        try:
+            timing = run_timed(
+                cfg.cmd,
+                cwd=cfg.cwd,
+                count_lines=count_lines,
+                process_started=controller.attach_process if controller is not None else None,
+            )
+        finally:
+            if controller is not None:
+                metadata = controller.stop()
+        return timing, metadata
 
     def _run_one_sample(
         self,
@@ -1366,19 +1847,20 @@ class BenchmarkRunner:
         br: BenchmarkResult,
     ) -> bool:
         """Run one measured sample, record it, and report taint status."""
-        if self.cache_mode == 'cold':
-            purge_cache(self.use_sudo)
-
         _, thermal_before = self.thermal.check_throttling()
         cpu_freq = self.thermal.get_cpu_frequency()
-        timing = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=False)
+        timing, sample_metadata = self._execute_config(
+            cfg,
+            count_lines=False,
+            collect_telemetry=True,
+        )
         _, thermal_after = self.thermal.check_throttling()
         if self._thermal_severity(thermal_after) >= self._thermal_severity(thermal_before):
             thermal_state = thermal_after
         else:
             thermal_state = thermal_before
 
-        self._record_sample(br, timing, thermal_state, cpu_freq)
+        self._record_sample(br, timing, thermal_state, cpu_freq, sample_metadata)
         return thermal_state not in ('nominal', 'unknown')
 
     def _run_replacement_samples(
@@ -1445,7 +1927,11 @@ class BenchmarkRunner:
         # before any performance measurements begin.
         eprint('  Capturing expected line counts...')
         for cfg in group.configs:
-            verification = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=True)
+            verification, _ = self._execute_config(
+                cfg,
+                count_lines=True,
+                collect_telemetry=False,
+            )
             if verification.line_count is not None:
                 result.results[cfg.name].line_counts.append(verification.line_count)
 
@@ -1477,7 +1963,11 @@ class BenchmarkRunner:
             if br.line_counts:
                 expected_lc = br.line_counts[0]
                 if expected_lc is not None:
-                    verify = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=True)
+                    verify, _ = self._execute_config(
+                        cfg,
+                        count_lines=True,
+                        collect_telemetry=False,
+                    )
                     if verify.line_count is not None and verify.line_count != expected_lc:
                         eprint(
                             '  WARNING: Post-measurement correctness check failed for %s: '
@@ -1568,20 +2058,7 @@ def _adaptive_thread_counts(system_info: Optional[Dict[str, Any]] = None) -> Lis
     if system_info is None:
         return [1, 2, 4, 6, 8]
 
-    topo = system_info.get('core_topology')
-    if not topo:
-        return [1, 2, 4, 6, 8]
-
-    # Find P-core logical count (level0 is typically Performance on Apple Silicon)
-    p_cores = None
-    for level_key in sorted(topo.keys()):
-        entry = topo.get(level_key)
-        if isinstance(entry, dict):
-            name = entry.get('name', '').lower()
-            if 'performance' in name or name.startswith('p'):
-                p_cores = entry.get('logical')
-                break
-
+    p_cores = performance_core_logical_count(system_info)
     if p_cores is None or p_cores < 1:
         return [1, 2, 4, 6, 8]
 
@@ -1667,6 +2144,57 @@ def scenario_thread_scaling_output(
     return BenchmarkGroup(
         name='thread_scaling_output',
         description='Thread scaling for output-heavy modes (--json and -o) on Linux kernel',
+        configs=configs,
+        interleaved=True,
+        cv_threshold=CV_THRESHOLD_MULTI_FILE,
+    )
+
+
+def scenario_thread_scaling_contention(
+    rg_bin: str, suite_dir: str,
+    system_info: Optional[Dict[str, Any]] = None,
+) -> BenchmarkGroup:
+    """Thread scaling with competing user-space CPU load and P-core telemetry."""
+    if not system_info or not system_info.get('is_apple_silicon'):
+        raise RuntimeError(
+            'thread_scaling_contention requires Apple Silicon core topology'
+        )
+    if not system_info.get('powermetrics_available'):
+        raise RuntimeError(
+            'thread_scaling_contention requires powermetrics to be installed'
+        )
+    if not system_info.get('sudo_enabled') or not system_info.get('sudo_ready'):
+        raise RuntimeError(
+            'thread_scaling_contention requires --sudo with non-interactive sudo access'
+        )
+
+    require_corpus(suite_dir, 'linux')
+    cwd = linux_dir(suite_dir)
+    pat = 'PM_RESUME'
+    thread_counts = _adaptive_thread_counts(system_info)
+    contender_count = performance_core_logical_count(system_info) or 4
+    controller_factory = make_contention_controller_factory(contender_count)
+
+    configs = []
+    for j in thread_counts:
+        configs.append(BenchmarkConfig(
+            name='rg -j%d (contended)' % j,
+            cmd=[rg_bin, '-n', '-j', str(j), pat],
+            cwd=cwd,
+            samples=THREAD_SCALING_SAMPLES,
+            warmups=DEFAULT_WARMUPS,
+            logical_name='rg -j%d' % j,
+            sample_controller_factory=controller_factory,
+        ))
+
+    return BenchmarkGroup(
+        name='thread_scaling_contention',
+        description=(
+            'Literal search "PM_RESUME" across Linux kernel while %d competing '
+            'CPU hogger process(es) contend for P-core scheduling; collects '
+            'powermetrics AMP evidence for ripgrep placement'
+            % contender_count
+        ),
         configs=configs,
         interleaved=True,
         cv_threshold=CV_THRESHOLD_MULTI_FILE,
@@ -1907,6 +2435,7 @@ def scenario_directory_io(
 ALL_SCENARIOS = {
     'thread_scaling': scenario_thread_scaling,
     'thread_scaling_output': scenario_thread_scaling_output,
+    'thread_scaling_contention': scenario_thread_scaling_contention,
     'mmap_vs_read': scenario_mmap_vs_read,
     'mmap_multiline': scenario_mmap_multiline,
     'multiline_vs_singleline': scenario_multiline_vs_singleline,
@@ -1931,7 +2460,11 @@ def apply_samples_override(
     if sample_override is None:
         return
     for cfg in group.configs:
-        if scenario_name in ('thread_scaling', 'thread_scaling_output'):
+        if scenario_name in (
+            'thread_scaling',
+            'thread_scaling_output',
+            'thread_scaling_contention',
+        ):
             cfg.samples = max(sample_override, THREAD_SCALING_SAMPLES)
         else:
             cfg.samples = sample_override
@@ -1961,6 +2494,7 @@ def labeled_config(cfg: BenchmarkConfig, label: str) -> BenchmarkConfig:
         cv_threshold=cfg.cv_threshold,
         logical_name=cfg.logical_name,
         variant_label=label,
+        sample_controller_factory=cfg.sample_controller_factory,
     )
 
 
@@ -2188,7 +2722,7 @@ def write_csv(
     lines, env.
     ARM-specific columns appended: chip, cores_used, thermal_state, cache_mode,
     cv, median, p5, p95, user_time, sys_time, binary_label, logical_name,
-    clean_sample, clean_n, best_clean.
+    clean_sample, clean_n, best_clean, plus contention/placement telemetry.
     """
     fields = [
         'benchmark', 'warmup_iter', 'iter',
@@ -2198,6 +2732,10 @@ def write_csv(
         'cv', 'median', 'p5', 'p95', 'user_time', 'sys_time',
         'cpu_freq_mhz', 'cv_mad', 'binary_label', 'logical_name',
         'clean_sample', 'clean_n', 'best_clean',
+        'contention', 'contention_kind', 'contention_workers',
+        'telemetry_status', 'p_core_dispatch', 'p_core_share',
+        'p_core_cycles', 'cpu_cycles', 'sample_cpu_ms_per_s',
+        'cluster_cpu_ms_per_s',
     ]
 
     chip = system_info.get('chip', 'unknown')
@@ -2235,6 +2773,14 @@ def write_csv(
                             cpu_freq_str = ';'.join(
                                 '%s=%d' % (k, v) for k, v in sorted(freq.items())
                             )
+                        meta = br.sample_metadata[i] if i < len(br.sample_metadata) else {}
+                        cluster_cpu = meta.get('cluster_cpu_ms_per_s')
+                        cluster_cpu_str = ''
+                        if isinstance(cluster_cpu, dict) and cluster_cpu:
+                            cluster_cpu_str = ';'.join(
+                                '%s=%.3f' % (k, v)
+                                for k, v in sorted(cluster_cpu.items())
+                            )
                         writer.writerow({
                             'benchmark': gr.group.name,
                             'warmup_iter': cfg.warmups,
@@ -2261,6 +2807,36 @@ def write_csv(
                             'clean_sample': '1' if i in clean_indices else '0',
                             'clean_n': br.clean_sample_count,
                             'best_clean': '%.6f' % best_clean if best_clean is not None else '',
+                            'contention': '1' if meta.get('contention_active') else '0',
+                            'contention_kind': meta.get('contention_kind', ''),
+                            'contention_workers': meta.get('contention_workers', ''),
+                            'telemetry_status': meta.get('telemetry_status', ''),
+                            'p_core_dispatch': (
+                                ''
+                                if meta.get('p_core_dispatch_observed') is None
+                                else ('1' if meta.get('p_core_dispatch_observed') else '0')
+                            ),
+                            'p_core_share': (
+                                '%.4f' % meta['p_core_share']
+                                if isinstance(meta.get('p_core_share'), (int, float))
+                                else ''
+                            ),
+                            'p_core_cycles': (
+                                '%.6f' % meta['p_core_cycles']
+                                if isinstance(meta.get('p_core_cycles'), (int, float))
+                                else ''
+                            ),
+                            'cpu_cycles': (
+                                '%.6f' % meta['cpu_cycles']
+                                if isinstance(meta.get('cpu_cycles'), (int, float))
+                                else ''
+                            ),
+                            'sample_cpu_ms_per_s': (
+                                '%.6f' % meta['sample_cpu_ms_per_s']
+                                if isinstance(meta.get('sample_cpu_ms_per_s'), (int, float))
+                                else ''
+                            ),
+                            'cluster_cpu_ms_per_s': cluster_cpu_str,
                         })
 
 
@@ -2278,7 +2854,7 @@ def write_json(
             'system': system_info,
             **run_metadata,
             'timestamp': datetime.datetime.now().isoformat(),
-            'arm_bench_version': '1.2.0',
+            'arm_bench_version': '1.3.0',
         },
         'suites': {},
         'regressions': regressions,
@@ -2323,6 +2899,8 @@ def write_json(
                     'line_counts': br.line_counts,
                     'thermal_states': br.thermal_states,
                     'cpu_frequencies': br.cpu_frequencies,
+                    'sample_metadata': br.sample_metadata,
+                    'placement_summary': br.placement_summary,
                     'stats': stats_dict,
                     'clean_stats': br.clean_stats,
                     'clean_sample_indices': br.clean_sample_indices,
@@ -2457,6 +3035,7 @@ def format_summary(
                 lc_str = ' (lines: %s)' % lc if lc is not None else ''
                 fast_marker = '*' if cfg_name == fastest_name else ' '
                 flags = ''
+                placement = br.placement_summary
                 if br.is_unreliable:
                     flags += ' [UNRELIABLE cv=%.1f%%]' % (st['cv'] * 100)
                 if br.outlier_count > 0:
@@ -2471,6 +3050,16 @@ def format_summary(
                     )
                 if br.clean_sample_count != sample_n:
                     flags += ' [CLEAN %d/%d]' % (br.clean_sample_count, sample_n)
+                if placement and placement.get('telemetry_sample_count', 0) > 0:
+                    flags += ' [P-CORE %d/%d' % (
+                        placement.get('p_core_dispatch_sample_count', 0),
+                        placement.get('telemetry_sample_count', 0),
+                    )
+                    if isinstance(placement.get('p_core_share'), (int, float)):
+                        flags += ', med share=%.0f%%' % (
+                            float(placement['p_core_share']) * 100
+                        )
+                    flags += ']'
 
                 if sample_n < 20:
                     range_label = ('min', 'max')
@@ -2494,6 +3083,38 @@ def format_summary(
                         flags,
                     )
                 )
+            placement_lines = []
+            for cfg_name, br in gr.results.items():
+                placement = br.placement_summary
+                if not placement or not placement.get('contention_enabled'):
+                    continue
+                telemetry_count = int(placement.get('telemetry_sample_count', 0))
+                pcore_count = int(placement.get('p_core_dispatch_sample_count', 0))
+                share = placement.get('p_core_share')
+                if telemetry_count > 0:
+                    placement_text = (
+                        '%s: P-core dispatch observed in %d/%d telemetry sample(s)'
+                        % (cfg_name, pcore_count, telemetry_count)
+                    )
+                    if isinstance(share, (int, float)):
+                        placement_text += ' (median P-share %.0f%%)' % (
+                            float(share) * 100
+                        )
+                else:
+                    placement_text = '%s: telemetry unavailable (%s)' % (
+                        cfg_name,
+                        ', '.join(
+                            '%s=%s' % item
+                            for item in sorted(
+                                placement.get('status_counts', {}).items()
+                            )
+                        ) or 'no samples',
+                    )
+                placement_lines.append(placement_text)
+            if placement_lines:
+                lines.append('  Scheduler placement:')
+                for placement_text in placement_lines:
+                    lines.append('    %s' % placement_text)
             lines.append('')
 
         if suite.comparisons:
@@ -2622,6 +3243,25 @@ def collect_suite_warnings(
                         % (
                             benchmark_key,
                             br.clean_sample_count,
+                        )
+                    )
+                placement = br.placement_summary
+                if (
+                    placement
+                    and placement.get('contention_enabled')
+                    and placement.get('telemetry_sample_count', 0) == 0
+                ):
+                    warnings.append(
+                        'Placement telemetry: %s collected no usable '
+                        'powermetrics samples (%s)'
+                        % (
+                            benchmark_key,
+                            ', '.join(
+                                '%s=%s' % item
+                                for item in sorted(
+                                    placement.get('status_counts', {}).items()
+                                )
+                            ) or 'unknown',
                         )
                     )
     return unreliable, warnings
@@ -2791,6 +3431,8 @@ Examples:
 
     # Detect system info
     system_info = detect_system_info()
+    system_info['sudo_enabled'] = args.sudo
+    system_info['sudo_ready'] = check_sudo_ready() if args.sudo else False
 
     # Seed random number generator for reproducibility
     seed = args.seed if args.seed is not None else random.randrange(2**32)
@@ -2802,6 +3444,13 @@ Examples:
         system_info.get('chip', 'unknown'),
         system_info.get('arch', 'unknown'),
     ))
+
+    if args.sudo and not system_info.get('sudo_ready'):
+        eprint(
+            'ERROR: --sudo requires cached or passwordless sudo because '
+            'arm_bench uses non-interactive sudo commands.'
+        )
+        return 1
 
     # Determine project root (assume arm_bench.py is in benchsuite/)
     script_dir = path.dirname(path.abspath(__file__))

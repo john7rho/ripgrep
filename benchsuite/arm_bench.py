@@ -742,6 +742,8 @@ class TimingResult:
         line_count: Optional[int],
         returncode: int,
         cpu_freq_mhz: Optional[Dict[str, int]] = None,
+        major_faults: int = 0,
+        minor_faults: int = 0,
     ) -> None:
         self.wall_time = wall_time
         self.user_time = user_time
@@ -749,6 +751,8 @@ class TimingResult:
         self.line_count = line_count
         self.returncode = returncode
         self.cpu_freq_mhz = cpu_freq_mhz
+        self.major_faults = major_faults
+        self.minor_faults = minor_faults
 
 
 def run_timed(
@@ -799,12 +803,20 @@ def run_timed(
     if count_lines and completed.stdout is not None:
         line_count = completed.stdout.count(b'\n')
 
+    major_faults = 0
+    minor_faults = 0
+    if resource is not None and ru_before is not None:
+        major_faults = ru_after.ru_majflt - ru_before.ru_majflt
+        minor_faults = ru_after.ru_minflt - ru_before.ru_minflt
+
     return TimingResult(
         wall_time=wall_time,
         user_time=user_time,
         sys_time=sys_time,
         line_count=line_count,
         returncode=completed.returncode,
+        major_faults=major_faults,
+        minor_faults=minor_faults,
     )
 
 
@@ -1147,6 +1159,8 @@ class BenchmarkResult:
         self.line_counts: List[Optional[int]] = []
         self.thermal_states: List[str] = []
         self.cpu_frequencies: List[Optional[Dict[str, int]]] = []
+        self.major_faults: List[int] = []
+        self.minor_faults: List[int] = []
         self._cached_stats: Optional[Dict[str, float]] = None
         self._cached_stats_len: int = 0
 
@@ -1431,6 +1445,8 @@ class BenchmarkRunner:
         br.sys_times.append(timing.sys_time)
         br.thermal_states.append(thermal_state)
         br.cpu_frequencies.append(cpu_freq)
+        br.major_faults.append(timing.major_faults)
+        br.minor_faults.append(timing.minor_faults)
 
     def _run_one_sample(
         self,
@@ -2158,6 +2174,8 @@ def check_regressions(
                 for warning in compare_warnings:
                     eprint('WARNING: %s: %s' % (full_key, warning))
 
+                cand_maj = sorted(br.major_faults)[len(br.major_faults) // 2] if br.major_faults else 0
+                cand_min = sorted(br.minor_faults)[len(br.minor_faults) // 2] if br.minor_faults else 0
                 regressions.append({
                     'benchmark': full_key,
                     'cache_mode': suite.cache_mode,
@@ -2171,6 +2189,8 @@ def check_regressions(
                     'power': entry['power'],
                     'n_baseline': entry['n_reference'],
                     'n_new': entry['n_candidate'],
+                    'major_faults': cand_maj,
+                    'minor_faults': cand_min,
                 })
 
     return regressions
@@ -2219,6 +2239,10 @@ def compare_ab_suites(
                     continue
                 for warning in compare_warnings:
                     warnings.append('A/B compare note for %s: %s' % (full_key, warning))
+                ref_maj = sorted(reference.major_faults)[len(reference.major_faults) // 2] if reference.major_faults else 0
+                ref_min = sorted(reference.minor_faults)[len(reference.minor_faults) // 2] if reference.minor_faults else 0
+                cand_maj = sorted(candidate.major_faults)[len(candidate.major_faults) // 2] if candidate.major_faults else 0
+                cand_min = sorted(candidate.minor_faults)[len(candidate.minor_faults) // 2] if candidate.minor_faults else 0
                 comparisons.append({
                     'benchmark': full_key,
                     'group': gr.group.name,
@@ -2239,6 +2263,10 @@ def compare_ab_suites(
                     'power': entry['power'],
                     'n_reference': entry['n_reference'],
                     'n_candidate': entry['n_candidate'],
+                    'reference_major_faults': ref_maj,
+                    'reference_minor_faults': ref_min,
+                    'candidate_major_faults': cand_maj,
+                    'candidate_minor_faults': cand_min,
                 })
         suite.comparisons = comparisons
     return warnings
@@ -2260,7 +2288,7 @@ def write_csv(
     lines, env.
     ARM-specific columns appended: chip, cores_used, thermal_state, cache_mode,
     cv, median, p5, p95, user_time, sys_time, binary_label, logical_name,
-    clean_sample, clean_n, best_clean.
+    clean_sample, clean_n, best_clean, major_faults, minor_faults.
     """
     fields = [
         'benchmark', 'warmup_iter', 'iter',
@@ -2270,6 +2298,7 @@ def write_csv(
         'cv', 'median', 'p5', 'p95', 'user_time', 'sys_time',
         'cpu_freq_mhz', 'cv_mad', 'binary_label', 'logical_name',
         'clean_sample', 'clean_n', 'best_clean',
+        'major_faults', 'minor_faults',
     ]
 
     chip = system_info.get('chip', 'unknown')
@@ -2333,6 +2362,8 @@ def write_csv(
                             'clean_sample': '1' if i in clean_indices else '0',
                             'clean_n': br.clean_sample_count,
                             'best_clean': '%.6f' % best_clean if best_clean is not None else '',
+                            'major_faults': br.major_faults[i] if i < len(br.major_faults) else '',
+                            'minor_faults': br.minor_faults[i] if i < len(br.minor_faults) else '',
                         })
 
 
@@ -2395,6 +2426,8 @@ def write_json(
                     'line_counts': br.line_counts,
                     'thermal_states': br.thermal_states,
                     'cpu_frequencies': br.cpu_frequencies,
+                    'major_faults': br.major_faults,
+                    'minor_faults': br.minor_faults,
                     'stats': stats_dict,
                     'clean_stats': br.clean_stats,
                     'clean_sample_indices': br.clean_sample_indices,
@@ -2566,6 +2599,13 @@ def format_summary(
                         flags,
                     )
                 )
+                if br.major_faults or br.minor_faults:
+                    med_major = sorted(br.major_faults)[len(br.major_faults) // 2] if br.major_faults else 0
+                    med_minor = sorted(br.minor_faults)[len(br.minor_faults) // 2] if br.minor_faults else 0
+                    lines.append(
+                        '    %*s  page_faults: major=%d  minor=%d (median per sample)'
+                        % (max_name_len + 2, '', med_major, med_minor)
+                    )
             lines.append('')
 
         if suite.comparisons:
@@ -2583,8 +2623,18 @@ def format_summary(
                 else:
                     status = 'NO SIG DIFF'
                 power_str = ', power=%.0f%%' % (comp['power'] * 100)
+                fault_str = ''
+                ref_maj = comp.get('reference_major_faults', 0)
+                cand_maj = comp.get('candidate_major_faults', 0)
+                ref_min = comp.get('reference_minor_faults', 0)
+                cand_min = comp.get('candidate_minor_faults', 0)
+                if ref_maj or cand_maj or ref_min or cand_min:
+                    fault_str = (
+                        '\n    page_faults: major %d->%d  minor %d->%d'
+                        % (ref_maj, cand_maj, ref_min, cand_min)
+                    )
                 lines.append(
-                    '  [%s] %s/%s: %.4fs -> %.4fs (%+.1f%%, p=%.4f%s)'
+                    '  [%s] %s/%s: %.4fs -> %.4fs (%+.1f%%, p=%.4f%s)%s'
                     % (
                         status,
                         comp['group'],
@@ -2594,6 +2644,7 @@ def format_summary(
                         comp['pct_change'] * 100,
                         comp['p_value'],
                         power_str,
+                        fault_str,
                     )
                 )
             lines.append('')
@@ -2611,11 +2662,17 @@ def format_summary(
             power_str = ''
             if 'power' in r:
                 power_str = ', power=%.0f%%' % (r['power'] * 100)
+            fault_str = ''
+            r_maj = r.get('major_faults', 0)
+            r_min = r.get('minor_faults', 0)
+            if r_maj or r_min:
+                fault_str = '  [faults: major=%d minor=%d]' % (r_maj, r_min)
             lines.append(
-                '  [%s] %s: %.4fs -> %.4fs (%+.1f%%, p=%.4f%s)'
+                '  [%s] %s: %.4fs -> %.4fs (%+.1f%%, p=%.4f%s)%s'
                 % (status, r['benchmark'],
                    r['baseline_median'], r['new_median'],
-                   r['pct_change'] * 100, r['p_value'], power_str)
+                   r['pct_change'] * 100, r['p_value'], power_str,
+                   fault_str)
             )
             if r['is_regression']:
                 any_regression = True

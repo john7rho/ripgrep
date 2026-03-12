@@ -28,6 +28,7 @@ import os
 import os.path as path
 import platform
 import random
+import signal
 import shutil
 import statistics
 import subprocess
@@ -1139,12 +1140,16 @@ class BenchmarkGroup:
         configs: List[BenchmarkConfig],
         interleaved: bool = True,
         cv_threshold: float = CV_THRESHOLD,
+        setup: Optional[Any] = None,
+        teardown: Optional[Any] = None,
     ) -> None:
         self.name = name
         self.description = description
         self.configs = configs
         self.interleaved = interleaved
         self.cv_threshold = cv_threshold
+        self.setup = setup        # Callable[[], None] — called before warmups
+        self.teardown = teardown  # Callable[[], None] — called after all samples
 
 
 class BenchmarkResult:
@@ -1524,119 +1529,128 @@ class BenchmarkRunner:
         eprint('\n=== %s ===' % group.name)
         eprint('  %s' % group.description)
 
-        # Determine sample count (use the max across configs)
-        sample_count = max(cfg.samples for cfg in group.configs)
-        warmup_count = max(cfg.warmups for cfg in group.configs)
+        if group.setup is not None:
+            eprint('  Running scenario setup...')
+            group.setup()
 
-        # Correctness pass: capture expected line counts.  This is a pure
-        # correctness check — it runs with count_lines=True (stdout piped)
-        # before any performance measurements begin.
-        eprint('  Capturing expected line counts...')
-        for cfg in group.configs:
-            verification = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=True)
-            if verification.line_count is not None:
-                result.results[cfg.name].line_counts.append(verification.line_count)
+        try:
+            # Determine sample count (use the max across configs)
+            sample_count = max(cfg.samples for cfg in group.configs)
+            warmup_count = max(cfg.warmups for cfg in group.configs)
 
-        # Warmups with convergence detection
-        self._run_warmups(group, result, warmup_count,
-                          convergence_threshold=self.convergence_threshold)
+            # Correctness pass: capture expected line counts.  This is a pure
+            # correctness check — it runs with count_lines=True (stdout piped)
+            # before any performance measurements begin.
+            eprint('  Capturing expected line counts...')
+            for cfg in group.configs:
+                verification = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=True)
+                if verification.line_count is not None:
+                    result.results[cfg.name].line_counts.append(verification.line_count)
 
-        # Samples (balanced alternation, stdout to /dev/null)
-        eprint('  Samples: %d per config (balanced alternation)...' % sample_count)
-        for s in range(sample_count):
-            # Balanced alternation instead of pure random shuffle
-            if group.interleaved:
-                configs_order = self._balanced_alternation(group.configs, s)
-            else:
-                configs_order = list(group.configs)
+            # Warmups with convergence detection
+            self._run_warmups(group, result, warmup_count,
+                              convergence_threshold=self.convergence_threshold)
 
-            for cfg in configs_order:
+            # Samples (balanced alternation, stdout to /dev/null)
+            eprint('  Samples: %d per config (balanced alternation)...' % sample_count)
+            for s in range(sample_count):
+                # Balanced alternation instead of pure random shuffle
+                if group.interleaved:
+                    configs_order = self._balanced_alternation(group.configs, s)
+                else:
+                    configs_order = list(group.configs)
+
+                for cfg in configs_order:
+                    br = result.results[cfg.name]
+                    self._run_one_sample(cfg, br)
+
+                eprint('  [%d/%d] done' % (s + 1, sample_count))
+
+            # Replacement sampling to recover from thermal taint and obvious outliers.
+            self._run_replacement_samples(group, result, sample_count)
+
+            # Post-measurement correctness verification
+            for cfg in group.configs:
                 br = result.results[cfg.name]
-                self._run_one_sample(cfg, br)
+                if br.line_counts:
+                    expected_lc = br.line_counts[0]
+                    if expected_lc is not None:
+                        verify = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=True)
+                        if verify.line_count is not None and verify.line_count != expected_lc:
+                            eprint(
+                                '  WARNING: Post-measurement correctness check failed for %s: '
+                                'expected %d lines, got %d'
+                                % (cfg.name, expected_lc, verify.line_count)
+                            )
 
-            eprint('  [%d/%d] done' % (s + 1, sample_count))
-
-        # Replacement sampling to recover from thermal taint and obvious outliers.
-        self._run_replacement_samples(group, result, sample_count)
-
-        # Post-measurement correctness verification
-        for cfg in group.configs:
-            br = result.results[cfg.name]
-            if br.line_counts:
-                expected_lc = br.line_counts[0]
-                if expected_lc is not None:
-                    verify = run_timed(cfg.cmd, cwd=cfg.cwd, count_lines=True)
-                    if verify.line_count is not None and verify.line_count != expected_lc:
-                        eprint(
-                            '  WARNING: Post-measurement correctness check failed for %s: '
-                            'expected %d lines, got %d'
-                            % (cfg.name, expected_lc, verify.line_count)
+            # Report thermal tainting
+            for cfg in group.configs:
+                br = result.results[cfg.name]
+                tainted = br.thermal_tainted_count
+                if tainted > 0:
+                    eprint(
+                        '  WARNING: %s had %d/%d samples collected during '
+                        'thermal throttling (indices: %s)'
+                        % (cfg.name, tainted, len(br.wall_times),
+                           ', '.join(str(i) for i in br.throttled_sample_indices))
+                    )
+                if br.clean_sample_count < sample_count:
+                    eprint(
+                        '  WARNING: %s has only %d/%d clean samples after %d retry round(s)'
+                        % (
+                            cfg.name,
+                            br.clean_sample_count,
+                            sample_count,
+                            self.sample_retries,
                         )
+                    )
 
-        # Report thermal tainting
-        for cfg in group.configs:
-            br = result.results[cfg.name]
-            tainted = br.thermal_tainted_count
-            if tainted > 0:
-                eprint(
-                    '  WARNING: %s had %d/%d samples collected during '
-                    'thermal throttling (indices: %s)'
-                    % (cfg.name, tainted, len(br.wall_times),
-                       ', '.join(str(i) for i in br.throttled_sample_indices))
-                )
-            if br.clean_sample_count < sample_count:
-                eprint(
-                    '  WARNING: %s has only %d/%d clean samples after %d retry round(s)'
-                    % (
-                        cfg.name,
-                        br.clean_sample_count,
-                        sample_count,
-                        self.sample_retries,
+            # Report quick stats and outliers
+            for cfg in group.configs:
+                br = result.results[cfg.name]
+                st = br.stats
+                sample_n = int(st.get('n', len(br.wall_times)))
+                best_clean = br.best_clean_time
+                flags = ''
+                if br.is_unreliable:
+                    flags += ' [UNRELIABLE: cv=%.1f%%]' % (st['cv'] * 100)
+                if br.outlier_count > 0:
+                    flags += ' [%d OUTLIER(S)]' % br.outlier_count
+                if br.clean_sample_count != sample_n:
+                    flags += ' [CLEAN %d/%d]' % (br.clean_sample_count, sample_n)
+                # Use min/max labels when n < 20
+                if sample_n < 20:
+                    eprint(
+                        '  %-30s median=%.4fs  best_clean=%s  min=%.4fs  max=%.4fs  CV=%.1f%%  cv_mad=%.1f%%%s'
+                        % (
+                            cfg.name,
+                            st['median'],
+                            '%.4fs' % best_clean if best_clean is not None else 'n/a',
+                            st['p5'],
+                            st['p95'],
+                            st['cv'] * 100,
+                            st['cv_mad'] * 100,
+                            flags,
+                        )
                     )
-                )
-
-        # Report quick stats and outliers
-        for cfg in group.configs:
-            br = result.results[cfg.name]
-            st = br.stats
-            sample_n = int(st.get('n', len(br.wall_times)))
-            best_clean = br.best_clean_time
-            flags = ''
-            if br.is_unreliable:
-                flags += ' [UNRELIABLE: cv=%.1f%%]' % (st['cv'] * 100)
-            if br.outlier_count > 0:
-                flags += ' [%d OUTLIER(S)]' % br.outlier_count
-            if br.clean_sample_count != sample_n:
-                flags += ' [CLEAN %d/%d]' % (br.clean_sample_count, sample_n)
-            # Use min/max labels when n < 20
-            if sample_n < 20:
-                eprint(
-                    '  %-30s median=%.4fs  best_clean=%s  min=%.4fs  max=%.4fs  CV=%.1f%%  cv_mad=%.1f%%%s'
-                    % (
-                        cfg.name,
-                        st['median'],
-                        '%.4fs' % best_clean if best_clean is not None else 'n/a',
-                        st['p5'],
-                        st['p95'],
-                        st['cv'] * 100,
-                        st['cv_mad'] * 100,
-                        flags,
+                else:
+                    eprint(
+                        '  %-30s median=%.4fs  best_clean=%s  p5=%.4fs  p95=%.4fs  CV=%.1f%%  cv_mad=%.1f%%%s'
+                        % (
+                            cfg.name,
+                            st['median'],
+                            '%.4fs' % best_clean if best_clean is not None else 'n/a',
+                            st['p5'],
+                            st['p95'],
+                            st['cv'] * 100,
+                            st['cv_mad'] * 100,
+                            flags,
+                        )
                     )
-                )
-            else:
-                eprint(
-                    '  %-30s median=%.4fs  best_clean=%s  p5=%.4fs  p95=%.4fs  CV=%.1f%%  cv_mad=%.1f%%%s'
-                    % (
-                        cfg.name,
-                        st['median'],
-                        '%.4fs' % best_clean if best_clean is not None else 'n/a',
-                        st['p5'],
-                        st['p95'],
-                        st['cv'] * 100,
-                        st['cv_mad'] * 100,
-                        flags,
-                    )
-                )
+        finally:
+            if group.teardown is not None:
+                eprint('  Running scenario teardown...')
+                group.teardown()
 
         return result
 
@@ -1992,6 +2006,117 @@ def scenario_directory_io(
     )
 
 
+def _spawn_cpu_load(n_workers: int) -> List[subprocess.Popen]:
+    """Spawn n_workers CPU-bound processes to saturate cores.
+
+    Each worker runs a tight arithmetic loop in Python. Because they are
+    launched from the same foreground session they inherit the default QoS
+    class, competing with ripgrep for P-core scheduling.
+    """
+    procs = []
+    # Tight loop that the OS cannot optimize away
+    worker_code = 'x=0\nwhile True: x+=1'
+    for _ in range(n_workers):
+        p = subprocess.Popen(
+            [sys.executable, '-c', worker_code],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        procs.append(p)
+    eprint('  Spawned %d CPU-contention workers (pids: %s)'
+           % (n_workers, ', '.join(str(p.pid) for p in procs)))
+    return procs
+
+
+def _kill_cpu_load(procs: List[subprocess.Popen]) -> None:
+    """Terminate and reap all contention worker processes."""
+    for p in procs:
+        try:
+            p.send_signal(signal.SIGKILL)
+        except OSError:
+            pass
+    for p in procs:
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    eprint('  Killed %d CPU-contention workers' % len(procs))
+
+
+def scenario_contention(
+    rg_bin: str, suite_dir: str,
+    system_info: Optional[Dict[str, Any]] = None,
+) -> BenchmarkGroup:
+    """Thread contention benchmark: ripgrep under P-core pressure.
+
+    Spawns CPU-bound workers equal to the P-core count to saturate
+    performance cores, then runs ripgrep at different -j values.
+    This validates that the thread cap optimization (capping at P-core
+    count) degrades gracefully under contention — fewer threads should
+    avoid spilling onto E-cores and contending with background load.
+
+    Compares: -j1, -j <p_cores>, -j <total_cores>
+    """
+    require_corpus(suite_dir, 'linux')
+    cwd = linux_dir(suite_dir)
+    pat = 'PM_RESUME'
+
+    # Determine P-core count and total cores
+    p_cores = 4  # fallback
+    total_logical = 10  # fallback
+    if system_info:
+        topo = system_info.get('core_topology')
+        if topo:
+            for level_key in sorted(topo.keys()):
+                entry = topo.get(level_key)
+                if isinstance(entry, dict):
+                    name = entry.get('name', '').lower()
+                    if 'performance' in name or name.startswith('p'):
+                        p_cores = entry.get('logical', p_cores)
+                        break
+        total_logical = system_info.get('total_logical_cpus', total_logical)
+
+    # Thread counts to compare: capped (P-cores) vs uncapped (all cores)
+    thread_counts = sorted(set([1, p_cores, total_logical]))
+
+    configs = []
+    for j in thread_counts:
+        configs.append(BenchmarkConfig(
+            name='rg -j%d (contended)' % j,
+            cmd=[rg_bin, '-n', '-j', str(j), pat],
+            cwd=cwd,
+            samples=THREAD_SCALING_SAMPLES,
+            warmups=DEFAULT_WARMUPS,
+        ))
+
+    # Number of contention workers = P-core count (saturate all P-cores)
+    contention_procs: List[subprocess.Popen] = []
+
+    def setup() -> None:
+        nonlocal contention_procs
+        # Let workers ramp up before measurements begin
+        contention_procs = _spawn_cpu_load(p_cores)
+        time.sleep(2)
+
+    def teardown() -> None:
+        nonlocal contention_procs
+        _kill_cpu_load(contention_procs)
+        contention_procs = []
+
+    return BenchmarkGroup(
+        name='contention',
+        description=(
+            'Literal search under CPU contention (%d busy workers saturating P-cores). '
+            'Compares -j%s' % (p_cores, '/-j'.join(str(j) for j in thread_counts))
+        ),
+        configs=configs,
+        interleaved=True,
+        cv_threshold=0.20,  # contention benchmarks are inherently noisier
+        setup=setup,
+        teardown=teardown,
+    )
+
+
 ALL_SCENARIOS = {
     'thread_scaling': scenario_thread_scaling,
     'thread_scaling_output': scenario_thread_scaling_output,
@@ -2000,6 +2125,7 @@ ALL_SCENARIOS = {
     'multiline_vs_singleline': scenario_multiline_vs_singleline,
     'large_file_single_threaded': scenario_large_file_single_threaded,
     'directory_io': scenario_directory_io,
+    'contention': scenario_contention,
 }
 
 

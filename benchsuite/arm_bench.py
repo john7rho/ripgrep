@@ -720,7 +720,9 @@ def _iter_task_entries(value: Any) -> List[Dict[str, Any]]:
             for entry in entries:
                 if isinstance(entry, dict):
                     tasks.append(entry)
-        for child in value.values():
+        for key, child in value.items():
+            if key == 'tasks':
+                continue
             tasks.extend(_iter_task_entries(child))
     elif isinstance(value, list):
         for child in value:
@@ -962,7 +964,7 @@ class ContentionSampleController(SampleController):
                     '--format', 'plist',
                     '--buffer-size', str(POWERMETRICS_SAMPLE_BUFFER),
                     '--sample-rate', str(self.sample_rate_ms),
-                    '--sample-count', '-1',
+                    '--sample-count', '0',
                     '--samplers', 'tasks',
                     '--show-process-amp',
                     '--show-process-ipc',
@@ -1827,9 +1829,9 @@ class BenchmarkRunner:
             controller = cfg.sample_controller_factory(collect_telemetry)
 
         metadata: Dict[str, Any] = {}
-        if controller is not None:
-            controller.start()
         try:
+            if controller is not None:
+                controller.start()
             timing = run_timed(
                 cfg.cmd,
                 cwd=cfg.cwd,

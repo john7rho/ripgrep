@@ -16,6 +16,7 @@ Usage:
     ./arm_bench.py --dir /tmp/benchsuite --baseline runs/arm-m5-baseline/raw.csv
     ./arm_bench.py --dir /tmp/benchsuite --compare-bin /tmp/rg-upstream --cache both
     ./arm_bench.py --dir /tmp/benchsuite --scenarios thread_scaling,mmap_vs_read
+    ./arm_bench.py --dir /tmp/benchsuite --profile time-profiler --profile-samples 1
     ./arm_bench.py --help
 """
 
@@ -28,12 +29,14 @@ import os
 import os.path as path
 import platform
 import random
+import re
 import signal
 import shutil
 import statistics
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 from collections import Counter
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -80,6 +83,56 @@ COOLDOWN_MIN_SECONDS = 30
 DEFAULT_SAMPLE_RETRIES = 6
 RETRY_COOLDOWN_SECONDS = 10
 MIN_COMPARISON_SAMPLES = 5
+DEFAULT_PROFILE_SAMPLES = 1
+DECISION_PROBE_TIMEOUT_SECONDS = 5.0
+XCTRACE_RECORD_MIN_SECONDS = 10
+XCTRACE_RECORD_DEFAULT_SECONDS = 30
+XCTRACE_RECORD_MAX_SECONDS = 240
+XCTRACE_RECORD_HEADROOM_SECONDS = 5
+XCTRACE_RECORD_SCALE = 4.0
+XCTRACE_RECORD_TIMEOUT_GRACE_SECONDS = 60
+ARM_BENCH_VERSION = '1.4.0'
+
+SEARCH_STRATEGY_MMAP = 'mmap'
+SEARCH_STRATEGY_READ_BY_LINE = 'read_by_line'
+SEARCH_STRATEGY_SLICE_BY_LINE = 'slice_by_line'
+SEARCH_STRATEGY_MULTILINE_HEAP = 'multiline_heap'
+
+XCTRACE_TEMPLATES = {
+    'time-profiler': 'Time Profiler',
+    'system-trace': 'System Trace',
+    'poi': 'Points of Interest',
+}
+XCTRACE_EXPORT_SCHEMA_PREFERENCES = {
+    'time-profiler': ['time-profile'],
+    'system-trace': [
+        'cpu-profile', 'thread-state', 'time-sample',
+        'cpu-usage', 'cpu-usage-by-core',
+    ],
+    'poi': ['points-of-interest', 'os-signpost'],
+}
+
+MMAP_AUTO_MAX_FILES = 8
+MMAP_AUTO_SMALL_FILE_BYTES = 64 * 1024
+MMAP_AUTO_MIN_FILE_BYTES = 1 << 20
+MMAP_AUTO_MIN_TOTAL_BYTES = 4 << 20
+MMAP_AUTO_MULTILINE_MIN_FILE_BYTES = 256 << 10
+MMAP_AUTO_MULTILINE_MIN_TOTAL_BYTES = 1 << 20
+
+COMMAND_FLAGS_WITH_VALUE = {
+    '-e', '--regexp',
+    '-f', '--file',
+    '-g', '--glob',
+    '-m', '--max-count',
+    '-M', '--max-columns',
+    '-t', '--type',
+    '-T', '--type-not',
+    '--pre',
+    '--replace',
+    '--sort',
+    '--sortr',
+    '--threads',
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -97,6 +150,13 @@ def run_cmd(cmd: List[str], **kwargs: Any) -> subprocess.CompletedProcess:
     eprint('# %s' % ' '.join(cmd))
     kwargs['check'] = True
     return subprocess.run(cmd, **kwargs)
+
+
+def safe_slug(value: str) -> str:
+    """Return a filesystem-safe slug for paths and artifact names."""
+    slug = re.sub(r'[^A-Za-z0-9._-]+', '-', value.strip())
+    slug = slug.strip('.-')
+    return slug or 'item'
 
 
 def sysctl_value(key: str) -> Optional[str]:
@@ -198,6 +258,542 @@ def check_background_interference(target_path: Optional[str] = None) -> List[str
         pass
 
     return interference_warnings
+
+
+def apple_pcore_count_detected(system_info: Dict[str, Any]) -> Optional[int]:
+    """Return the detected Apple Silicon P-core count when available."""
+    topo = system_info.get('core_topology')
+    if isinstance(topo, dict):
+        for level_key in sorted(topo.keys()):
+            entry = topo.get(level_key)
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get('name', '')).lower()
+            logical = entry.get('logical')
+            if (
+                isinstance(logical, int)
+                and logical > 0
+                and ('performance' in name or name.startswith('p'))
+            ):
+                return logical
+    value = sysctl_value('hw.perflevel0.logicalcpu')
+    if value:
+        try:
+            parsed = int(value)
+            if parsed > 0:
+                return parsed
+        except ValueError:
+            pass
+    return None
+
+
+def _extract_rg_shape(
+    cmd: List[str],
+    cwd: Optional[str],
+) -> Dict[str, Any]:
+    """Best-effort parse of the rg command shape used by the benchmark."""
+    args = list(cmd[1:])
+    patterns: List[str] = []
+    paths: List[str] = []
+    positional: List[str] = []
+    explicit_threads: Optional[int] = None
+    sort_forces_single_thread = False
+    multiline = False
+    multiline_dotall = False
+    mmap_mode = 'auto'
+
+    i = 0
+    saw_terminator = False
+    while i < len(args):
+        arg = args[i]
+        if not saw_terminator and arg == '--':
+            saw_terminator = True
+            i += 1
+            continue
+        if not saw_terminator and arg.startswith('--threads='):
+            raw = arg.split('=', 1)[1]
+            explicit_threads = None if raw == '0' else int(raw)
+            i += 1
+            continue
+        if not saw_terminator and arg.startswith('-j') and len(arg) > 2:
+            raw = arg[2:]
+            explicit_threads = None if raw == '0' else int(raw)
+            i += 1
+            continue
+        if not saw_terminator and arg in ('-j', '--threads'):
+            if i + 1 < len(args):
+                raw = args[i + 1]
+                explicit_threads = None if raw == '0' else int(raw)
+                i += 2
+                continue
+        if not saw_terminator and arg in ('--sort', '--sortr', '--sort-files'):
+            sort_forces_single_thread = True
+            if arg in ('--sort', '--sortr') and i + 1 < len(args):
+                i += 2
+            else:
+                i += 1
+            continue
+        if not saw_terminator and (
+            arg.startswith('--sort=')
+            or arg.startswith('--sortr=')
+        ):
+            sort_forces_single_thread = True
+            i += 1
+            continue
+        if not saw_terminator and arg in ('-U', '--multiline'):
+            multiline = True
+            i += 1
+            continue
+        if not saw_terminator and arg == '--no-multiline':
+            multiline = False
+            i += 1
+            continue
+        if not saw_terminator and arg == '--multiline-dotall':
+            multiline_dotall = True
+            i += 1
+            continue
+        if not saw_terminator and arg == '--no-multiline-dotall':
+            multiline_dotall = False
+            i += 1
+            continue
+        if not saw_terminator and arg == '--mmap':
+            mmap_mode = 'always'
+            i += 1
+            continue
+        if not saw_terminator and arg == '--no-mmap':
+            mmap_mode = 'never'
+            i += 1
+            continue
+        if not saw_terminator and arg.startswith('-') and arg in COMMAND_FLAGS_WITH_VALUE:
+            if arg in ('-e', '--regexp') and i + 1 < len(args):
+                patterns.append(args[i + 1])
+            i += 2
+            continue
+        if not saw_terminator and arg.startswith('-'):
+            i += 1
+            continue
+        positional.append(arg)
+        i += 1
+
+    if not patterns and positional:
+        patterns.append(positional[0])
+        paths = positional[1:]
+    else:
+        paths = positional
+
+    resolved_paths: List[str] = []
+    for pth in paths:
+        if pth == '-':
+            resolved_paths.append(pth)
+            continue
+        if path.isabs(pth):
+            resolved_paths.append(pth)
+        elif cwd:
+            resolved_paths.append(path.abspath(path.join(cwd, pth)))
+        else:
+            resolved_paths.append(path.abspath(pth))
+
+    explicit_file_paths = [
+        pth for pth in resolved_paths if pth != '-' and path.isfile(pth)
+    ]
+    explicit_non_files = [
+        pth for pth in resolved_paths
+        if pth != '-' and not path.isfile(pth)
+    ]
+    path_mode = 'implicit'
+    if not resolved_paths:
+        path_mode = 'implicit'
+    elif resolved_paths == ['-']:
+        path_mode = 'stdin'
+    elif explicit_non_files:
+        path_mode = 'explicit_non_file'
+    else:
+        path_mode = 'explicit_files'
+
+    return {
+        'patterns': patterns,
+        'paths': resolved_paths,
+        'explicit_file_paths': explicit_file_paths,
+        'path_mode': path_mode,
+        'has_implicit_path': not resolved_paths,
+        'is_only_stdin': resolved_paths == ['-'],
+        'is_one_file': len(explicit_file_paths) == 1 and len(resolved_paths) == 1,
+        'explicit_threads': explicit_threads,
+        'sort_forces_single_thread': sort_forces_single_thread,
+        'multiline': multiline,
+        'multiline_dotall': multiline_dotall,
+        'mmap_mode': mmap_mode,
+    }
+
+
+def _auto_mmap_stats(shape: Dict[str, Any]) -> Optional[Dict[str, int]]:
+    """Return hiargs-style auto-mmap stats for explicit file paths."""
+    if shape['has_implicit_path']:
+        return None
+    if shape['is_only_stdin']:
+        return None
+    paths = shape['paths']
+    if not paths:
+        return None
+
+    file_count = 0
+    total_bytes = 0
+    max_file_bytes = 0
+    small_file_count = 0
+    for pth in paths:
+        if pth == '-':
+            return None
+        try:
+            metadata = os.stat(pth)
+        except OSError:
+            return None
+        if not path.isfile(pth):
+            return None
+        file_count += 1
+        total_bytes += metadata.st_size
+        max_file_bytes = max(max_file_bytes, metadata.st_size)
+        if metadata.st_size <= MMAP_AUTO_SMALL_FILE_BYTES:
+            small_file_count += 1
+
+    if file_count == 0:
+        return None
+    return {
+        'file_count': file_count,
+        'total_bytes': total_bytes,
+        'max_file_bytes': max_file_bytes,
+        'small_file_count': small_file_count,
+    }
+
+
+def _auto_mmap_enabled(shape: Dict[str, Any]) -> Tuple[bool, Optional[Dict[str, int]], str]:
+    """Mirror hiargs auto-mmap selection for explicit file paths."""
+    stats = _auto_mmap_stats(shape)
+    if stats is None:
+        if shape['has_implicit_path']:
+            return False, None, 'path selection was implicit'
+        if shape['is_only_stdin']:
+            return False, None, 'searching stdin'
+        return False, None, 'paths were not explicit regular files'
+
+    file_count = stats['file_count']
+    total_bytes = stats['total_bytes']
+    max_file_bytes = stats['max_file_bytes']
+    small_file_count = stats['small_file_count']
+    if file_count == 0 or file_count > MMAP_AUTO_MAX_FILES:
+        return False, stats, 'file count outside auto-mmap limits'
+    if file_count > 2 and small_file_count == file_count:
+        return False, stats, 'all explicit files were tiny'
+    if shape['multiline']:
+        min_file_bytes = MMAP_AUTO_MULTILINE_MIN_FILE_BYTES
+        min_total_bytes = MMAP_AUTO_MULTILINE_MIN_TOTAL_BYTES
+    else:
+        min_file_bytes = MMAP_AUTO_MIN_FILE_BYTES
+        min_total_bytes = MMAP_AUTO_MIN_TOTAL_BYTES
+    enabled = (
+        max_file_bytes >= min_file_bytes
+        or total_bytes >= min_total_bytes
+    )
+    if enabled:
+        reason = 'explicit files met auto-mmap size thresholds'
+    else:
+        reason = 'explicit files were below auto-mmap size thresholds'
+    return enabled, stats, reason
+
+
+def _infer_multiline_with_matcher(shape: Dict[str, Any]) -> bool:
+    """Best-effort mirror of Searcher::multi_line_with_matcher for rg CLI use."""
+    if not shape['multiline']:
+        return False
+    combined = '\n'.join(shape['patterns'])
+    if '\n' in combined or r'\n' in combined or r'\r\n' in combined:
+        return True
+    if '(?s' in combined and '.' in combined:
+        return True
+    if shape['multiline_dotall'] and '.' in combined:
+        return True
+    if r'\p{any}' in combined:
+        return True
+    return False
+
+
+def infer_decision_metadata(
+    cmd: List[str],
+    cwd: Optional[str],
+    system_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Infer decision metadata by mirroring current hiargs/searcher logic."""
+    shape = _extract_rg_shape(cmd, cwd)
+    pcore_count = apple_pcore_count_detected(system_info)
+    if shape['sort_forces_single_thread'] or shape['is_one_file']:
+        threads_selected = 1
+        threads_reason = 'single-threaded due to sorting or single explicit file'
+    elif shape['explicit_threads'] is not None:
+        threads_selected = shape['explicit_threads']
+        threads_reason = 'explicit --threads/-j override'
+    else:
+        available = system_info.get('total_logical_cpus') or os.cpu_count() or 1
+        if system_info.get('is_apple_silicon'):
+            cap = pcore_count or 4
+            threads_reason = 'auto-selected and capped to Apple P-core count'
+        else:
+            cap = 12
+            threads_reason = 'auto-selected and capped to default parallel limit'
+        threads_selected = min(int(available), int(cap))
+
+    auto_mmap_enabled, auto_stats, auto_reason = _auto_mmap_enabled(shape)
+    mmap_mode = shape['mmap_mode']
+    effective_mmap_enabled = (
+        mmap_mode == 'always'
+        or (mmap_mode == 'auto' and auto_mmap_enabled)
+    )
+    multiline_with_matcher = _infer_multiline_with_matcher(shape)
+    if multiline_with_matcher:
+        if effective_mmap_enabled:
+            search_strategy = SEARCH_STRATEGY_MMAP
+            strategy_detail = 'multiline search can use mmap directly'
+        else:
+            search_strategy = SEARCH_STRATEGY_MULTILINE_HEAP
+            strategy_detail = 'multiline search falls back to heap-backed strategy'
+    else:
+        if effective_mmap_enabled and not system_info.get('is_apple_silicon'):
+            search_strategy = SEARCH_STRATEGY_SLICE_BY_LINE
+            strategy_detail = 'single-line mmap search uses slice-by-line'
+        else:
+            search_strategy = SEARCH_STRATEGY_READ_BY_LINE
+            if effective_mmap_enabled and system_info.get('is_apple_silicon'):
+                strategy_detail = (
+                    'Apple Silicon skips mmap for single-line searches and '
+                    'uses streaming read-by-line'
+                )
+            else:
+                strategy_detail = 'streaming read-by-line strategy'
+
+    metadata: Dict[str, Any] = {
+        'threads_selected': threads_selected,
+        'threads_reason': threads_reason,
+        'apple_pcore_count_detected': pcore_count,
+        'mmap_mode': mmap_mode,
+        'auto_mmap_enabled': auto_mmap_enabled,
+        'auto_mmap_reason': auto_reason,
+        'effective_mmap_enabled': effective_mmap_enabled,
+        'path_mode': shape['path_mode'],
+        'explicit_file_count': (
+            auto_stats['file_count'] if auto_stats is not None else 0
+        ),
+        'explicit_total_bytes': (
+            auto_stats['total_bytes'] if auto_stats is not None else 0
+        ),
+        'explicit_max_file_bytes': (
+            auto_stats['max_file_bytes'] if auto_stats is not None else 0
+        ),
+        'multiline_enabled': shape['multiline'],
+        'multiline_dotall': shape['multiline_dotall'],
+        'multiline_with_matcher': multiline_with_matcher,
+        'search_strategy': search_strategy,
+        'search_strategy_detail': strategy_detail,
+        'decision_source': 'inferred',
+    }
+    return metadata
+
+
+def probe_decision_metadata(
+    cmd: List[str],
+    cwd: Optional[str],
+) -> Dict[str, Any]:
+    """Probe the target rg binary with --trace and extract actual decisions.
+
+    The probe is intentionally short lived: it captures early hiargs/searcher
+    logs and terminates after a small timeout. This keeps metadata collection
+    cheap while still reflecting the behavior of the binary under test.
+    """
+    if len(cmd) < 1:
+        return {}
+    probe_cmd = [cmd[0], '--trace'] + cmd[1:]
+    try:
+        proc = subprocess.Popen(
+            probe_cmd,
+            cwd=cwd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError:
+        return {}
+
+    stderr_text = ''
+    timed_out = False
+    try:
+        _, stderr_text = proc.communicate(timeout=DECISION_PROBE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        stderr_text = exc.stderr or ''
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        _, extra_stderr = proc.communicate()
+        stderr_text += extra_stderr or ''
+
+    probe: Dict[str, Any] = {
+        'decision_probe_timed_out': timed_out,
+    }
+    for line in stderr_text.splitlines():
+        if 'using ' in line and 'thread(s)' in line and 'threads_selected' not in probe:
+            match = re.search(r'using (\d+) thread\(s\)', line)
+            if match:
+                probe['threads_selected'] = int(match.group(1))
+                probe['threads_reason'] = 'reported by --trace probe'
+        if 'auto-mmap ' in line and 'auto_mmap_enabled' not in probe:
+            enabled = 'auto-mmap enabled' in line
+            probe['auto_mmap_enabled'] = enabled
+            probe['auto_mmap_reason'] = line.split('auto-mmap ', 1)[1].strip()
+        if 'searching via memory map' in line and 'search_strategy' not in probe:
+            probe['search_strategy'] = SEARCH_STRATEGY_MMAP
+            probe['multiline_with_matcher'] = '(multiline)' in line
+            probe['search_strategy_detail'] = line.strip()
+        elif (
+            'searching via slice-by-line strategy' in line
+            and 'search_strategy' not in probe
+        ):
+            probe['search_strategy'] = SEARCH_STRATEGY_SLICE_BY_LINE
+            probe['multiline_with_matcher'] = False
+            probe['search_strategy_detail'] = line.strip()
+        elif (
+            'searching via roll buffer strategy' in line
+            and 'search_strategy' not in probe
+        ):
+            probe['search_strategy'] = SEARCH_STRATEGY_READ_BY_LINE
+            probe['multiline_with_matcher'] = False
+            probe['search_strategy_detail'] = line.strip()
+        elif (
+            'searching via multiline strategy' in line
+            and 'search_strategy' not in probe
+        ):
+            probe['search_strategy'] = SEARCH_STRATEGY_MULTILINE_HEAP
+            probe['multiline_with_matcher'] = True
+            probe['search_strategy_detail'] = line.strip()
+        if (
+            'search_strategy' in probe
+            and 'threads_selected' in probe
+            and 'auto_mmap_enabled' in probe
+        ):
+            break
+
+    if len(probe) > 1:
+        probe['decision_source'] = 'probe+inference'
+    return probe
+
+
+def merge_decision_metadata(
+    inferred: Dict[str, Any],
+    probed: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Merge inferred metadata with probe-derived overrides."""
+    merged = dict(inferred)
+    for key, value in probed.items():
+        if value is not None:
+            merged[key] = value
+    if merged.get('mmap_mode') == 'always':
+        merged['effective_mmap_enabled'] = True
+    elif merged.get('mmap_mode') == 'never':
+        merged['effective_mmap_enabled'] = False
+    else:
+        merged['effective_mmap_enabled'] = bool(
+            merged.get('auto_mmap_enabled')
+        )
+    return merged
+
+
+def decision_metadata_for_command(
+    cmd: List[str],
+    cwd: Optional[str],
+    system_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Compute benchmark decision metadata for a specific rg invocation."""
+    inferred = infer_decision_metadata(cmd, cwd, system_info)
+    probed = probe_decision_metadata(cmd, cwd)
+    return merge_decision_metadata(inferred, probed)
+
+
+def format_bool_csv(value: Optional[bool]) -> str:
+    """Format an optional boolean for CSV output."""
+    if value is None:
+        return ''
+    return '1' if value else '0'
+
+
+def _strip_xml_namespaces(root: ET.Element) -> ET.Element:
+    """Remove namespaces in-place to simplify xctrace TOC parsing."""
+    for elem in root.iter():
+        if '}' in elem.tag:
+            elem.tag = elem.tag.split('}', 1)[1]
+    return root
+
+
+def summarize_xctrace_toc(toc_text: str) -> Dict[str, Any]:
+    """Summarize an xctrace TOC export into a compact JSON-friendly dict."""
+    summary: Dict[str, Any] = {
+        'available_schemas': [],
+        'tracks': [],
+    }
+    try:
+        root = _strip_xml_namespaces(ET.fromstring(toc_text))
+    except ET.ParseError:
+        summary['parse_error'] = 'unable to parse xctrace TOC XML'
+        return summary
+
+    run = root.find('.//run')
+    if run is not None:
+        for attr in (
+            'number', 'start-time', 'end-time', 'duration',
+            'template', 'template-name', 'recording-mode',
+        ):
+            if attr in run.attrib:
+                summary[attr.replace('-', '_')] = run.attrib[attr]
+
+    schemas: List[str] = []
+    for elem in root.iter():
+        schema = elem.attrib.get('schema')
+        if schema and schema not in schemas:
+            schemas.append(schema)
+        if elem.tag == 'track':
+            name = elem.attrib.get('name')
+            if name:
+                summary['tracks'].append(name)
+    summary['available_schemas'] = schemas
+    return summary
+
+
+def choose_xctrace_export_schema(
+    mode: str,
+    available_schemas: Sequence[str],
+) -> Optional[str]:
+    """Choose the most useful xctrace schema to export for a given mode."""
+    preferred = XCTRACE_EXPORT_SCHEMA_PREFERENCES.get(mode, [])
+    available_set = set(available_schemas)
+    for schema in preferred:
+        if schema in available_set:
+            return schema
+    return None
+
+
+def xctrace_record_completed_despite_returncode(
+    result: subprocess.CompletedProcess,
+    trace_path: str,
+) -> bool:
+    """Return True when xctrace saved a usable trace despite a non-zero status."""
+    if result.returncode == 0:
+        return True
+    stdout = result.stdout or ''
+    stderr = (result.stderr or '').strip()
+    if not path.exists(trace_path):
+        return False
+    if stderr:
+        return False
+    return (
+        'Recording completed. Saving output file...' in stdout
+        and 'Output file saved as:' in stdout
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +1323,338 @@ def detect_binary_profile(rg_bin: str) -> str:
     return 'custom'
 
 
+def detect_xctrace_version() -> Optional[str]:
+    """Return the installed xctrace version, if available."""
+    try:
+        result = subprocess.run(
+            ['xcrun', 'xctrace', 'version'],
+            capture_output=True, text=True, timeout=10,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    version = (result.stdout or result.stderr).strip()
+    return version or None
+
+
+class XctraceProfiler:
+    """Optional xctrace artifact capture for selected benchmark samples."""
+
+    def __init__(
+        self,
+        mode: str,
+        output_dir: str,
+        scenario_names: Optional[Sequence[str]] = None,
+        sample_count: int = DEFAULT_PROFILE_SAMPLES,
+        on_best_delta: bool = False,
+    ) -> None:
+        self.mode = mode
+        self.template = XCTRACE_TEMPLATES[mode]
+        self.output_dir = output_dir
+        self.scenario_names = (
+            None if scenario_names is None else set(scenario_names)
+        )
+        self.sample_count = sample_count
+        self.on_best_delta = on_best_delta
+        self.xctrace_version = detect_xctrace_version()
+
+    def enabled_for_group(self, group_name: str) -> bool:
+        """Return True when a group should emit profiling artifacts."""
+        return (
+            self.scenario_names is None
+            or group_name in self.scenario_names
+        )
+
+    @staticmethod
+    def representative_sample_index(br: 'BenchmarkResult') -> Optional[int]:
+        """Choose the clean sample closest to the clean median."""
+        indices = br.clean_sample_indices or list(range(len(br.wall_times)))
+        if not indices:
+            return None
+        if br.clean_wall_times:
+            target = br.clean_stats['median']
+        else:
+            target = br.stats['median']
+        return min(indices, key=lambda idx: abs(br.wall_times[idx] - target))
+
+    def select_targets(
+        self,
+        group: 'BenchmarkGroup',
+        result: 'GroupResult',
+    ) -> List[Tuple['BenchmarkConfig', int, str]]:
+        """Return configs/sample indices that should be profiled."""
+        if self.on_best_delta:
+            return self._select_best_delta_targets(group, result)
+
+        targets: List[Tuple['BenchmarkConfig', int, str]] = []
+        for cfg in group.configs:
+            br = result.results[cfg.name]
+            indices = br.clean_sample_indices or list(range(len(br.wall_times)))
+            for idx in indices[:self.sample_count]:
+                targets.append((cfg, idx, 'profile-samples'))
+        return targets
+
+    def _select_best_delta_targets(
+        self,
+        group: 'BenchmarkGroup',
+        result: 'GroupResult',
+    ) -> List[Tuple['BenchmarkConfig', int, str]]:
+        """Choose representative samples for the largest delta in a group."""
+        chosen: List[Tuple['BenchmarkConfig', int, str]] = []
+        best_pair: List['BenchmarkConfig'] = []
+
+        labeled = [cfg for cfg in group.configs if cfg.variant_label]
+        if labeled:
+            pairings: Dict[str, List['BenchmarkConfig']] = {}
+            for cfg in labeled:
+                pairings.setdefault(cfg.logical_name, []).append(cfg)
+            max_delta = -1.0
+            for logical_name, cfgs in pairings.items():
+                if len(cfgs) < 2:
+                    continue
+                first = result.results[cfgs[0].name]
+                second = result.results[cfgs[1].name]
+                first_median = statistics.median(first.comparison_wall_times)
+                second_median = statistics.median(second.comparison_wall_times)
+                if first_median <= 0 or second_median <= 0:
+                    continue
+                delta = abs(first_median - second_median) / min(
+                    first_median, second_median
+                )
+                if delta > max_delta:
+                    max_delta = delta
+                    best_pair = cfgs[:2]
+            if best_pair:
+                for cfg in best_pair:
+                    br = result.results[cfg.name]
+                    idx = self.representative_sample_index(br)
+                    if idx is not None:
+                        chosen.append((cfg, idx, 'best-delta'))
+                return chosen
+
+        medians: List[Tuple[float, 'BenchmarkConfig']] = []
+        for cfg in group.configs:
+            br = result.results[cfg.name]
+            if not br.comparison_wall_times:
+                continue
+            medians.append((statistics.median(br.comparison_wall_times), cfg))
+        if not medians:
+            return []
+        medians.sort(key=lambda item: item[0])
+        best_pair = [medians[0][1]]
+        if len(medians) > 1:
+            best_pair.append(medians[-1][1])
+        seen: set = set()
+        for cfg in best_pair:
+            if cfg.name in seen:
+                continue
+            seen.add(cfg.name)
+            br = result.results[cfg.name]
+            idx = self.representative_sample_index(br)
+            if idx is not None:
+                chosen.append((cfg, idx, 'best-delta'))
+        return chosen
+
+    def _artifact_base(
+        self,
+        cache_mode: str,
+        group_name: str,
+        cfg_name: str,
+        sample_idx: int,
+    ) -> str:
+        artifact_dir = path.join(
+            self.output_dir,
+            safe_slug(cache_mode),
+            safe_slug(group_name),
+            safe_slug(cfg_name),
+        )
+        os.makedirs(artifact_dir, exist_ok=True)
+        return path.join(
+            artifact_dir,
+            '%s-sample-%02d-%s' % (
+                safe_slug(cfg_name),
+                sample_idx,
+                safe_slug(self.mode),
+            ),
+        )
+
+    def record_time_limit_seconds(
+        self,
+        sample_wall_time: Optional[float],
+    ) -> int:
+        """Return a bounded xctrace record duration for a replayed sample."""
+        if sample_wall_time is None or sample_wall_time <= 0:
+            return XCTRACE_RECORD_DEFAULT_SECONDS
+        estimated = int(
+            math.ceil(
+                sample_wall_time * XCTRACE_RECORD_SCALE
+                + XCTRACE_RECORD_HEADROOM_SECONDS
+            )
+        )
+        return max(
+            XCTRACE_RECORD_MIN_SECONDS,
+            min(XCTRACE_RECORD_MAX_SECONDS, estimated),
+        )
+
+    def capture(
+        self,
+        cache_mode: str,
+        group_name: str,
+        cfg: 'BenchmarkConfig',
+        sample_idx: int,
+        selection_reason: str,
+        use_sudo: bool,
+        sample_wall_time: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Capture a single profiling replay and return its artifact metadata."""
+        warnings: List[str] = []
+        if cache_mode == 'cold':
+            purge_cache(use_sudo)
+
+        base = self._artifact_base(cache_mode, group_name, cfg.name, sample_idx)
+        trace_path = base + '.trace'
+        toc_path = base + '.toc.xml'
+        export_path = base + '.export.xml'
+        summary_path = base + '.summary.json'
+        record_time_limit_seconds = self.record_time_limit_seconds(sample_wall_time)
+        record_cmd = [
+            'xcrun', 'xctrace', 'record',
+            '--template', self.template,
+            '--output', trace_path,
+            '--time-limit', '%ds' % record_time_limit_seconds,
+            '--no-prompt',
+            '--target-stdin', os.devnull,
+            '--target-stdout', os.devnull,
+            '--launch', '--',
+        ] + list(cfg.cmd)
+        try:
+            result = subprocess.run(
+                record_cmd,
+                cwd=cfg.cwd,
+                capture_output=True,
+                text=True,
+                timeout=record_time_limit_seconds + XCTRACE_RECORD_TIMEOUT_GRACE_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as err:
+            warnings.append('xctrace record failed for %s: %s' % (cfg.name, err))
+            artifact = {
+                'profile_mode': self.mode,
+                'profile_template': self.template,
+                'selection_reason': selection_reason,
+                'sample_index': sample_idx,
+                'trace_path': trace_path,
+                'summary_path': summary_path,
+                'warnings': warnings,
+                'status': 'failed',
+            }
+            with open(summary_path, 'w') as f:
+                json.dump(artifact, f, indent=2)
+            return artifact
+
+        artifact: Dict[str, Any] = {
+            'profile_mode': self.mode,
+            'profile_template': self.template,
+            'selection_reason': selection_reason,
+            'sample_index': sample_idx,
+            'trace_path': trace_path,
+            'summary_path': summary_path,
+            'record_time_limit_seconds': record_time_limit_seconds,
+            'xctrace_version': self.xctrace_version,
+            'record_returncode': result.returncode,
+            'status': 'ok' if path.exists(trace_path) else 'failed',
+            'warnings': warnings,
+        }
+        if result.stdout:
+            artifact['record_stdout'] = result.stdout
+        if result.stderr:
+            artifact['record_stderr'] = result.stderr
+        if sample_wall_time is not None:
+            artifact['sample_wall_time_seconds'] = sample_wall_time
+        if result.returncode != 0:
+            if xctrace_record_completed_despite_returncode(result, trace_path):
+                artifact['record_returncode_ignored'] = True
+                artifact['record_returncode_note'] = (
+                    'xctrace returned non-zero despite successful completion'
+                )
+            else:
+                warnings.append(
+                    'xctrace record returned non-zero exit code %d for %s'
+                    % (result.returncode, cfg.name)
+                )
+        if not path.exists(trace_path):
+            warnings.append(
+                'trace bundle was not created: %s' % trace_path
+            )
+            artifact['status'] = 'failed'
+            with open(summary_path, 'w') as f:
+                json.dump(artifact, f, indent=2)
+            return artifact
+
+        toc_summary: Dict[str, Any] = {}
+        try:
+            toc_result = subprocess.run(
+                ['xcrun', 'xctrace', 'export', '--input', trace_path, '--toc'],
+                cwd=cfg.cwd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as err:
+            warnings.append('xctrace TOC export failed for %s: %s' % (cfg.name, err))
+            toc_result = None
+        if toc_result is not None and toc_result.returncode == 0 and toc_result.stdout:
+            with open(toc_path, 'w') as f:
+                f.write(toc_result.stdout)
+            toc_summary = summarize_xctrace_toc(toc_result.stdout)
+            artifact['toc_path'] = toc_path
+            artifact['toc_summary'] = toc_summary
+            schema = choose_xctrace_export_schema(
+                self.mode,
+                toc_summary.get('available_schemas', []),
+            )
+            if schema:
+                artifact['export_schema'] = schema
+                try:
+                    export_result = subprocess.run(
+                        [
+                            'xcrun', 'xctrace', 'export',
+                            '--input', trace_path,
+                            '--xpath',
+                            '/trace-toc/run[@number="1"]/data/table[@schema="%s"]'
+                            % schema,
+                        ],
+                        cwd=cfg.cwd,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as err:
+                    warnings.append(
+                        'xctrace schema export failed for %s: %s'
+                        % (cfg.name, err)
+                    )
+                else:
+                    if export_result.returncode == 0 and export_result.stdout:
+                        with open(export_path, 'w') as f:
+                            f.write(export_result.stdout)
+                        artifact['export_path'] = export_path
+                    else:
+                        warnings.append(
+                            'xctrace schema export returned %d for %s'
+                            % (export_result.returncode, cfg.name)
+                        )
+        elif toc_result is not None:
+            warnings.append(
+                'xctrace TOC export returned %d for %s'
+                % (toc_result.returncode, cfg.name)
+            )
+
+        with open(summary_path, 'w') as f:
+            json.dump(artifact, f, indent=2)
+        return artifact
+
+
 # ---------------------------------------------------------------------------
 # Timing and execution
 # ---------------------------------------------------------------------------
@@ -1166,6 +2094,8 @@ class BenchmarkResult:
         self.cpu_frequencies: List[Optional[Dict[str, int]]] = []
         self.major_faults: List[int] = []
         self.minor_faults: List[int] = []
+        self.decision_metadata: Dict[str, Any] = {}
+        self.profile_artifacts: Dict[int, Dict[str, Any]] = {}
         self._cached_stats: Optional[Dict[str, float]] = None
         self._cached_stats_len: int = 0
 
@@ -1299,19 +2229,25 @@ class BenchmarkRunner:
         self,
         rg_bin: str,
         suite_dir: str,
+        system_info: Dict[str, Any],
         thermal: ThermalMonitor,
         cache_mode: str = 'warm',
         use_sudo: bool = False,
         convergence_threshold: float = 0.05,
         sample_retries: int = DEFAULT_SAMPLE_RETRIES,
+        decision_cache: Optional[Dict[Tuple[Tuple[str, ...], Optional[str]], Dict[str, Any]]] = None,
+        profiler: Optional[XctraceProfiler] = None,
     ) -> None:
         self.rg_bin = rg_bin
         self.suite_dir = suite_dir
+        self.system_info = system_info
         self.thermal = thermal
         self.cache_mode = cache_mode
         self.use_sudo = use_sudo
         self.convergence_threshold = convergence_threshold
         self.sample_retries = sample_retries
+        self.decision_cache = {} if decision_cache is None else decision_cache
+        self.profiler = profiler
 
     @staticmethod
     def _thermal_severity(state: str) -> int:
@@ -1453,6 +2389,28 @@ class BenchmarkRunner:
         br.major_faults.append(timing.major_faults)
         br.minor_faults.append(timing.minor_faults)
 
+    def _decision_metadata(self, cfg: BenchmarkConfig) -> Dict[str, Any]:
+        """Return cached decision metadata for a benchmark config."""
+        key = (tuple(cfg.cmd), cfg.cwd)
+        metadata = self.decision_cache.get(key)
+        if metadata is None:
+            metadata = decision_metadata_for_command(
+                cfg.cmd,
+                cfg.cwd,
+                self.system_info,
+            )
+            self.decision_cache[key] = metadata
+        return dict(metadata)
+
+    def _populate_decision_metadata(
+        self,
+        group: BenchmarkGroup,
+        result: GroupResult,
+    ) -> None:
+        """Attach decision metadata to each config before measurement begins."""
+        for cfg in group.configs:
+            result.results[cfg.name].decision_metadata = self._decision_metadata(cfg)
+
     def _run_one_sample(
         self,
         cfg: BenchmarkConfig,
@@ -1537,6 +2495,7 @@ class BenchmarkRunner:
             # Determine sample count (use the max across configs)
             sample_count = max(cfg.samples for cfg in group.configs)
             warmup_count = max(cfg.warmups for cfg in group.configs)
+            self._populate_decision_metadata(group, result)
 
             # Correctness pass: capture expected line counts.  This is a pure
             # correctness check — it runs with count_lines=True (stdout piped)
@@ -1647,6 +2606,29 @@ class BenchmarkRunner:
                             flags,
                         )
                     )
+
+            if self.profiler is not None and self.profiler.enabled_for_group(group.name):
+                targets = self.profiler.select_targets(group, result)
+                if targets:
+                    eprint(
+                        '  Profiling %d selected sample replay(s) with xctrace (%s)...'
+                        % (len(targets), self.profiler.mode)
+                    )
+                for cfg, sample_idx, selection_reason in targets:
+                    br = result.results[cfg.name]
+                    sample_wall_time = None
+                    if 0 <= sample_idx < len(br.wall_times):
+                        sample_wall_time = br.wall_times[sample_idx]
+                    artifact = self.profiler.capture(
+                        self.cache_mode,
+                        group.name,
+                        cfg,
+                        sample_idx,
+                        selection_reason,
+                        self.use_sudo,
+                        sample_wall_time=sample_wall_time,
+                    )
+                    br.profile_artifacts[sample_idx] = artifact
         finally:
             if group.teardown is not None:
                 eprint('  Running scenario teardown...')
@@ -2414,7 +3396,8 @@ def write_csv(
     lines, env.
     ARM-specific columns appended: chip, cores_used, thermal_state, cache_mode,
     cv, median, p5, p95, user_time, sys_time, binary_label, logical_name,
-    clean_sample, clean_n, best_clean, major_faults, minor_faults.
+    clean_sample, clean_n, best_clean, major_faults, minor_faults,
+    decision metadata, and optional xctrace artifact paths.
     """
     fields = [
         'benchmark', 'warmup_iter', 'iter',
@@ -2425,6 +3408,18 @@ def write_csv(
         'cpu_freq_mhz', 'cv_mad', 'binary_label', 'logical_name',
         'clean_sample', 'clean_n', 'best_clean',
         'major_faults', 'minor_faults',
+        'threads_selected', 'threads_reason',
+        'apple_pcore_count_detected',
+        'mmap_mode', 'auto_mmap_enabled', 'auto_mmap_reason',
+        'effective_mmap_enabled', 'path_mode',
+        'explicit_file_count', 'explicit_total_bytes',
+        'explicit_max_file_bytes',
+        'multiline_enabled', 'multiline_dotall', 'multiline_with_matcher',
+        'search_strategy', 'search_strategy_detail',
+        'decision_source',
+        'profile_mode', 'profile_selection',
+        'profile_trace_path', 'profile_summary_path',
+        'profile_export_schema', 'profile_export_path',
     ]
 
     chip = system_info.get('chip', 'unknown')
@@ -2454,6 +3449,7 @@ def write_csv(
                     stats = br.stats
                     clean_indices = set(br.clean_sample_indices)
                     best_clean = br.best_clean_time
+                    decision = br.decision_metadata
                     for i, wt in enumerate(br.wall_times):
                         thermal = br.thermal_states[i] if i < len(br.thermal_states) else ''
                         cpu_freq_str = ''
@@ -2462,6 +3458,7 @@ def write_csv(
                             cpu_freq_str = ';'.join(
                                 '%s=%d' % (k, v) for k, v in sorted(freq.items())
                             )
+                        artifact = br.profile_artifacts.get(i, {})
                         writer.writerow({
                             'benchmark': gr.group.name,
                             'warmup_iter': cfg.warmups,
@@ -2490,6 +3487,41 @@ def write_csv(
                             'best_clean': '%.6f' % best_clean if best_clean is not None else '',
                             'major_faults': br.major_faults[i] if i < len(br.major_faults) else '',
                             'minor_faults': br.minor_faults[i] if i < len(br.minor_faults) else '',
+                            'threads_selected': decision.get('threads_selected', ''),
+                            'threads_reason': decision.get('threads_reason', ''),
+                            'apple_pcore_count_detected': decision.get('apple_pcore_count_detected', ''),
+                            'mmap_mode': decision.get('mmap_mode', ''),
+                            'auto_mmap_enabled': format_bool_csv(
+                                decision.get('auto_mmap_enabled')
+                            ),
+                            'auto_mmap_reason': decision.get('auto_mmap_reason', ''),
+                            'effective_mmap_enabled': format_bool_csv(
+                                decision.get('effective_mmap_enabled')
+                            ),
+                            'path_mode': decision.get('path_mode', ''),
+                            'explicit_file_count': decision.get('explicit_file_count', ''),
+                            'explicit_total_bytes': decision.get('explicit_total_bytes', ''),
+                            'explicit_max_file_bytes': decision.get('explicit_max_file_bytes', ''),
+                            'multiline_enabled': format_bool_csv(
+                                decision.get('multiline_enabled')
+                            ),
+                            'multiline_dotall': format_bool_csv(
+                                decision.get('multiline_dotall')
+                            ),
+                            'multiline_with_matcher': format_bool_csv(
+                                decision.get('multiline_with_matcher')
+                            ),
+                            'search_strategy': decision.get('search_strategy', ''),
+                            'search_strategy_detail': decision.get(
+                                'search_strategy_detail', ''
+                            ),
+                            'decision_source': decision.get('decision_source', ''),
+                            'profile_mode': artifact.get('profile_mode', ''),
+                            'profile_selection': artifact.get('selection_reason', ''),
+                            'profile_trace_path': artifact.get('trace_path', ''),
+                            'profile_summary_path': artifact.get('summary_path', ''),
+                            'profile_export_schema': artifact.get('export_schema', ''),
+                            'profile_export_path': artifact.get('export_path', ''),
                         })
 
 
@@ -2507,7 +3539,7 @@ def write_json(
             'system': system_info,
             **run_metadata,
             'timestamp': datetime.datetime.now().isoformat(),
-            'arm_bench_version': '1.2.0',
+            'arm_bench_version': ARM_BENCH_VERSION,
         },
         'suites': {},
         'regressions': regressions,
@@ -2554,6 +3586,8 @@ def write_json(
                     'cpu_frequencies': br.cpu_frequencies,
                     'major_faults': br.major_faults,
                     'minor_faults': br.minor_faults,
+                    'decision_metadata': br.decision_metadata,
+                    'profile_artifacts': br.profile_artifacts,
                     'stats': stats_dict,
                     'clean_stats': br.clean_stats,
                     'clean_sample_indices': br.clean_sample_indices,
@@ -2563,7 +3597,47 @@ def write_json(
                     'cv_threshold': br.cv_threshold,
                     'outlier_indices': br.outlier_indices,
                     'outlier_count': br.outlier_count,
+                    'samples': [],
                 }
+                clean_indices = set(br.clean_sample_indices)
+                for i, wt in enumerate(br.wall_times):
+                    sample_record: Dict[str, Any] = {
+                        'iter': i,
+                        'duration': wt,
+                        'user_time': (
+                            br.user_times[i] if i < len(br.user_times) else None
+                        ),
+                        'sys_time': (
+                            br.sys_times[i] if i < len(br.sys_times) else None
+                        ),
+                        'line_count': br.line_counts[0] if br.line_counts else None,
+                        'thermal_state': (
+                            br.thermal_states[i]
+                            if i < len(br.thermal_states)
+                            else None
+                        ),
+                        'cpu_frequency': (
+                            br.cpu_frequencies[i]
+                            if i < len(br.cpu_frequencies)
+                            else None
+                        ),
+                        'major_faults': (
+                            br.major_faults[i]
+                            if i < len(br.major_faults)
+                            else None
+                        ),
+                        'minor_faults': (
+                            br.minor_faults[i]
+                            if i < len(br.minor_faults)
+                            else None
+                        ),
+                        'clean_sample': i in clean_indices,
+                        'decision_metadata': br.decision_metadata,
+                    }
+                    artifact = br.profile_artifacts.get(i)
+                    if artifact is not None:
+                        sample_record['profile_artifact'] = artifact
+                    config_data['samples'].append(sample_record)
                 group_data['configs'][cfg_name] = config_data
             suite_benchmarks[gr.group.name] = group_data
         output['suites'][suite.cache_mode] = {
@@ -2635,6 +3709,30 @@ def format_summary(
         lines.append(
             '  Compare prof.: %s'
             % run_metadata.get('compare_profile', 'unknown')
+        )
+    if run_metadata.get('profile_mode'):
+        lines.append(
+            '  Profiling:     %s (%s)'
+            % (
+                run_metadata.get('profile_mode'),
+                run_metadata.get('profile_template', 'unknown'),
+            )
+        )
+        if run_metadata.get('profile_scenarios'):
+            lines.append(
+                '  Profile scope: %s'
+                % ', '.join(run_metadata.get('profile_scenarios', []))
+            )
+        if run_metadata.get('profile_on_best_delta'):
+            lines.append('  Profile pick:  best delta per profiled group')
+        else:
+            lines.append(
+                '  Profile pick:  first %s clean sample(s) per config'
+                % run_metadata.get('profile_samples', DEFAULT_PROFILE_SAMPLES)
+            )
+        lines.append(
+            '  Profile dir:   %s'
+            % run_metadata.get('profile_output_dir', 'unknown')
         )
     lines.append('  Timestamp:     %s' % system_info.get('timestamp', ''))
     if 'core_topology' in system_info:
@@ -2879,6 +3977,12 @@ def collect_suite_warnings(
                             br.clean_sample_count,
                         )
                     )
+                for sample_idx, artifact in sorted(br.profile_artifacts.items()):
+                    for artifact_warning in artifact.get('warnings', []):
+                        warnings.append(
+                            'Profiling: %s sample %d: %s'
+                            % (benchmark_key, sample_idx, artifact_warning)
+                        )
     return unreliable, warnings
 
 
@@ -2904,6 +4008,7 @@ Examples:
   %(prog)s --dir /tmp/benchsuite --scenarios thread_scaling,mmap_vs_read
   %(prog)s --dir /tmp/benchsuite --baseline runs/arm-m5-baseline/raw.csv
   %(prog)s --dir /tmp/benchsuite --compare-bin /tmp/rg-upstream --cache both
+  %(prog)s --dir /tmp/benchsuite --profile time-profiler --profile-samples 1
   %(prog)s --dir /tmp/benchsuite --list
         ''',
     )
@@ -2959,6 +4064,29 @@ Examples:
     p.add_argument(
         '--summary', metavar='PATH', default=None,
         help='Path to write human-readable summary (also printed to stdout).',
+    )
+    p.add_argument(
+        '--profile',
+        choices=sorted(XCTRACE_TEMPLATES.keys()),
+        default=None,
+        help='Capture xctrace artifacts for selected benchmark samples. '
+             'Choices: %s.' % ', '.join(sorted(XCTRACE_TEMPLATES.keys())),
+    )
+    p.add_argument(
+        '--profile-scenarios', metavar='LIST', default=None,
+        help='Comma-separated list of scenarios to profile when --profile '
+             'is enabled. Default: all selected scenarios.',
+    )
+    profile_selection = p.add_mutually_exclusive_group()
+    profile_selection.add_argument(
+        '--profile-samples', type=int, default=None,
+        help='Profile the first N clean samples per config (default: %d).'
+             % DEFAULT_PROFILE_SAMPLES,
+    )
+    profile_selection.add_argument(
+        '--profile-on-best-delta', action='store_true', default=False,
+        help='After each profiled scenario, replay xctrace for the config(s) '
+             'with the largest clean median delta.',
     )
     p.add_argument(
         '--cache', choices=['warm', 'cold', 'both'], default='warm',
@@ -3019,6 +4147,21 @@ Examples:
                'Results may not be statistically meaningful.' % args.samples)
     if args.sample_retries < 0:
         eprint('ERROR: --sample-retries must be >= 0.')
+        return 1
+    if (
+        args.profile is None and (
+            args.profile_scenarios is not None
+            or args.profile_samples is not None
+            or args.profile_on_best_delta
+        )
+    ):
+        eprint(
+            'ERROR: --profile-scenarios/--profile-samples/'
+            '--profile-on-best-delta require --profile.'
+        )
+        return 1
+    if args.profile_samples is not None and args.profile_samples < 1:
+        eprint('ERROR: --profile-samples must be >= 1.')
         return 1
 
     cache_modes = parse_cache_modes(args.cache)
@@ -3170,6 +4313,20 @@ Examples:
     else:
         scenario_names = list(ALL_SCENARIOS.keys())
 
+    profile_scenario_names: Optional[List[str]] = None
+    if args.profile_scenarios:
+        profile_scenario_names = [
+            s.strip() for s in args.profile_scenarios.split(',')
+            if s.strip()
+        ]
+        for s in profile_scenario_names:
+            if s not in ALL_SCENARIOS:
+                eprint('ERROR: Unknown profile scenario: %s' % s)
+                eprint('Available: %s' % ', '.join(ALL_SCENARIOS.keys()))
+                return 1
+    elif args.profile:
+        profile_scenario_names = list(scenario_names)
+
     # Check output file conflicts
     for outpath in [args.raw, args.json, args.summary]:
         if outpath and path.exists(outpath) and not args.force:
@@ -3204,6 +4361,41 @@ Examples:
             'sysctl readings. Use --sudo for powermetrics-based monitoring.'
         )
 
+    profiler: Optional[XctraceProfiler] = None
+    profile_output_dir: Optional[str] = None
+    if args.profile:
+        if not is_macos():
+            eprint('ERROR: xctrace profiling is only supported on macOS.')
+            return 1
+        profile_output_dir = path.join(
+            script_dir,
+            'results',
+            'profiles',
+            datetime.datetime.now().strftime('%Y%m%d-%H%M%S'),
+        )
+        os.makedirs(profile_output_dir, exist_ok=args.force)
+        profile_sample_count = (
+            args.profile_samples
+            if args.profile_samples is not None
+            else DEFAULT_PROFILE_SAMPLES
+        )
+        profiler = XctraceProfiler(
+            mode=args.profile,
+            output_dir=profile_output_dir,
+            scenario_names=profile_scenario_names,
+            sample_count=profile_sample_count,
+            on_best_delta=args.profile_on_best_delta,
+        )
+        if profiler.xctrace_version is None:
+            eprint(
+                'ERROR: xctrace was requested, but `xcrun xctrace` is not available.'
+            )
+            return 1
+        eprint(
+            'Profiling enabled: %s -> %s'
+            % (args.profile, profile_output_dir)
+        )
+
     # Build scenario groups
     groups: List[BenchmarkGroup] = []
     for name in scenario_names:
@@ -3234,6 +4426,7 @@ Examples:
 
     # Add background warnings to warning list
     warnings.extend(bg_warnings)
+    decision_cache: Dict[Tuple[Tuple[str, ...], Optional[str]], Dict[str, Any]] = {}
 
     # Run benchmarks, once per selected cache mode
     suite_results: List[SuiteResult] = []
@@ -3243,11 +4436,14 @@ Examples:
         runner = BenchmarkRunner(
             rg_bin=rg_bin,
             suite_dir=suite_dir,
+            system_info=system_info,
             thermal=thermal,
             cache_mode=cache_mode,
             use_sudo=args.sudo,
             convergence_threshold=args.convergence_threshold,
             sample_retries=args.sample_retries,
+            decision_cache=decision_cache,
+            profiler=profiler,
         )
 
         group_results: List[GroupResult] = []
@@ -3300,6 +4496,16 @@ Examples:
             'compare_profile': compare_profile,
             'primary_label': args.primary_label,
             'compare_label': args.compare_label,
+        })
+    if profiler is not None:
+        run_metadata.update({
+            'profile_mode': profiler.mode,
+            'profile_template': profiler.template,
+            'profile_output_dir': profile_output_dir,
+            'profile_scenarios': profile_scenario_names,
+            'profile_samples': profiler.sample_count,
+            'profile_on_best_delta': profiler.on_best_delta,
+            'xctrace_version': profiler.xctrace_version,
         })
 
     # Generate summary
